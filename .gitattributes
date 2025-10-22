@@ -1,0 +1,5 @@
+# 标记所有 PNG 为二进制（完整文件提交）
+*.png binary
+Java/JVM/img/*.png binary
+# 可选：标记 MD 文件处理（如果有编码问题）
+*.md diff=asciidoc

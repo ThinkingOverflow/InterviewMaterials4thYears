@@ -1,3 +1,4 @@
+## 一、常见主要问题
 ### 1、JVM 里面常见的 3 种常量池
 Class 文件常量池、运行时常量池、字符串常量池。
 
@@ -62,7 +63,7 @@ JVM 里面常见一个类（new）包括：**类加载检查、内存分配、�
 
 在 JVM（HotSpot 实现）中，内存分配是多线程环境下的高频操作，因此指针碰撞和空闲列表算法都需确保线程安全，避免并发分配导致的内存覆盖或数据不一致。
 
-主要通过**原子操作（如 CAS）和线程本地缓冲（TLAB）**机制实现。TLAB 是核心优化：每个线程预分配一块私有缓冲区，在缓冲内分配无需同步；缓冲耗尽时，再从全局堆原子申请新 TLAB。
+主要通过 **原子操作（如 CAS）和线程本地缓冲（TLAB）** 机制实现。TLAB 是核心优化：每个线程预分配一块私有缓冲区，在缓冲内分配无需同步；缓冲耗尽时，再从全局堆原子申请新 TLAB。
 
 #### （1）指针碰撞
 
@@ -89,6 +90,156 @@ JVM 对空闲列表加 synchronized 锁（Java 层）或 OS 互斥锁（底层�
 **CAS 原子操作（优化路径）**：
 
 适用于低竞争场景，重试机制处理失败。
+
+### 6、对象主要包含哪几部分
+
+普通对象主要由对象头、实例数据和对齐填充组成，数组对象额外包含数组长度字段。对象大小通常为 8 字节对齐（64 位 JVM），总大小 = 对象头 + 实例数据 + 填充。
+
+![alt text](/Java/JVM/img/image1.png)
+
+### 7、内存泄露的原因
+
+#### （1）静态集合不当使用
+静态集合持有大量无用对象引用，未及时清理，导致 GC 无法回收（静态对象只有在类卸载的时候才会被回收，类卸载的要求较为严格）。
+
+**案例描述**：静态 HashMap 不断添加用户对象，但未移除过期项，导致所有对象无法被 GC 回收。
+~~~ java
+import java.util.HashMap;
+import java.util.Map;
+
+public class StaticCollectionLeak {
+    private static final Map<String, User> userCache = new HashMap<>();  // 静态集合
+
+    static class User {
+        String name;
+        User(String name) { this.name = name; }
+    }
+
+    public static void main(String[] args) {
+        for (int i = 0; i < 100000; i++) {  // 模拟大量添加
+            userCache.put("user" + i, new User("User" + i));  // 未移除，泄漏
+            System.out.println("Added user" + i);
+            if (i % 10000 == 0) {
+                try { Thread.sleep(100); } catch (InterruptedException e) {}  // 延时观察
+            }
+        }
+    }
+}
+~~~
+
+#### （2）未关闭的资源（字节流、Socket、数据库连接）
+
+资源对象持有外部引用（如文件句柄、连接池），未调用 close()，导致引用链断不开。
+
+**案例描述**：在循环中打开文件输入流，但未关闭，导致流对象和底层文件句柄持续占用内存。
+
+~~~ java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public class ResourceLeak {
+    public static void main(String[] args) {
+        for (int i = 0; i < 10000; i++) {  // 模拟多次打开文件
+            try {
+                FileInputStream fis = new FileInputStream("test.txt");  // 未 close()
+                byte[] buffer = new byte[1024];
+                fis.read(buffer);  // 读取但不关闭
+                System.out.println("Read file " + i);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            // 缺少 fis.close(); 导致泄漏
+        }
+    }
+}
+~~~
+
+#### (3) 长生命周期对象持有短生命周期引用
+
+案例描述：静态单例持有临时请求对象列表，未释放，导致所有请求对象存活。
+
+#### (4) 线程池或线程未正确关闭
+
+案例描述：创建 ExecutorService，但未调用 shutdown()，导致线程和任务对象积累。
+~~~ java
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class ThreadPoolLeak {
+    public static void main(String[] args) {
+        ExecutorService executor = Executors.newFixedThreadPool(10);  // 未 shutdown()
+
+        for (int i = 0; i < 100000; i++) {
+            final int taskId = i;
+            executor.submit(() -> {  // 提交任务，但线程池不关闭
+                try { Thread.sleep(10); } catch (InterruptedException e) {}
+                System.out.println("Task " + taskId + " executed");
+            });
+        }
+        // 缺少 executor.shutdown(); 导致线程和任务引用泄漏
+    }
+}
+~~~
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 二、常见案例以及回答
+
+### 1、开发的过程种有没有遇到过内存泄露，是怎么检测的，怎么解决的
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
