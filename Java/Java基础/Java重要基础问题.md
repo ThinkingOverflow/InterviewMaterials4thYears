@@ -157,7 +157,7 @@ poll 是 select 的改进版，用户传入一个 **pollfd 结构体数组（包
 
 ##### （3）epoll
 
-原理：epoll 专为高并发设计，用户先创建** epoll fd（epoll_create）**，然后通过 epoll_ctl 添加/修改/删除 fd 和事件。内核使用红黑树存储 fd，链表存储就绪事件。epoll_wait 阻塞等待，内核直接返回就绪事件数组（epoll_event 结构体）。
+原理：epoll 专为高并发设计，用户先创建**epoll fd（epoll_create）**，然后通过 epoll_ctl 添加/修改/删除 fd 和事件。内核使用红黑树存储 fd，链表存储就绪事件。epoll_wait 阻塞等待，内核直接返回就绪事件数组（epoll_event 结构体）。
 
 系统调用：
 int epoll_create(int size);（创建 epoll fd，size 是提示大小）。
@@ -260,7 +260,7 @@ java.net.Socket（BIO） / SocketChannel（NIO）
 
 #### （1）反射原理
 
-**反射的本质是**：一个 .class 文件的核心是**常量池包含字面量和符号引用）和属性表**，所有类名、方法名、注解、泛型信息都存在常量池里。在加载类时会把 .class 文件中的常量池和属性表解析成 C++ 的 InstanceKlass 结构，java.lang.Class 对象只是它的 Java 镜像。反射 API 实际上是对 InstanceKlass 中方法、字段、注解等信息的封装和拷贝，配合 setAccessible + 动态代理/字节码操作实现运行时动态访问私有成员。
+**反射的本质是**：一个 .class 文件的核心是**常量池（包含字面量和符号引用）和属性表**，所有类名、方法名、注解、泛型信息都存在常量池里。在加载类时会把 .class 文件中的常量池和属性表解析成 C++ 的 InstanceKlass 结构，java.lang.Class 对象只是它的 Java 镜像。反射 API 实际上是对 InstanceKlass 中方法、字段、注解等信息的封装和拷贝，配合 setAccessible + 动态代理/字节码操作实现运行时动态访问私有成员。
 
 .class 文件和 Class对象（instanceKlass 结构）如下：
 ![alt text](/Java/Java基础/img/image-1.png)
@@ -282,39 +282,180 @@ Method[] methods = User.class.getDeclaredMethods();
 - JSON 序列化：Jackson/Fastjson → 反射调用所有 getter/setter
 - 插件化/通用工具：Dubbo SPI、BeanUtils、JUnit、Lombok
 
-#### （3）动态代理
+#### （3）反射为什么执行效率低（慢）
 
+- 反射涉及动态类型解析，因此不能执行 JVM 优化（如JIT优化）
+- 使用反射的时候，需要将参数先包装 Object[] 类型，使用的时候在拆包围真正的类型，这些对象的包装和解包，不仅耗费时间，而且会产生比较多的对象，导致JVM容易触发 GC，使得程序变慢
+
+
+#### （4）动态代理
+
+##### 官方 JDK 代理
 **Java 动态代理 = 反射的“实战最强形态”**
-
-Java 动态代理 = 在程序运行期间，JVM 根据接口动态生成一个**实现类字节码**，然后加载到 JVM 中，这个生成的实现类就是代理对象。
 
 官方只有一种实现方式：java.lang.reflect.Proxy + InvocationHandler
 
 ~~~ java
-// 核心代码就这几行
-UserService target = new UserServiceImpl();
+public class JdkDynamicProxyDemo {
 
-UserService proxy = (UserService) Proxy.newProxyInstance(
-    target.getClass().getClassLoader(),
-    target.getClass().getInterfaces(),   // 必须是接口！
-    new InvocationHandler() {
-        @Override
-        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            System.out.println("日志开始...");
-            Object result = method.invoke(target, args);  // ← 反射调用！
-            System.out.println("日志结束");
-            return result;
-        }
-    });
+    public static void main(String[] args) throws Exception {
+
+        // 1. 真实对象
+        UserService real = new UserServiceImpl();
+
+        // 2. 用 JDK 动态代理创建一个“假的 UserService”
+        UserService proxy = (UserService) Proxy.newProxyInstance(
+            JdkDynamicProxyDemo.class.getClassLoader(),
+            new Class[]{UserService.class},   // 必须传接口
+            new InvocationHandler() {         // ← 匿名内部类！这就是核心
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+                    System.out.println("【JDK 代理】方法开始: " + method.getName());
+                    long start = System.nanoTime();
+                    
+                    // 真正调用真实对象的方法（反射）
+                    Object result = method.invoke(real, args);
+                    
+                    System.out.println("【JDK 代理】方法结束，耗时: " 
+                        + (System.nanoTime() - start) / 1000 + "μs");
+                    return result;
+                }
+            }
+        );
+
+        // 3. 使用代理对象
+        proxy.add("张三");    // 看起来是调用接口方法，其实走的 invoke
+        int count = proxy.query();
+        System.out.println("返回结果: " + count);
+    }
+}
+
+interface UserService {
+    void add(String name);
+    int query();
+}
+
+class UserServiceImpl implements UserService {
+    @Override public void add(String name)   { System.out.println("真实添加用户: " + name); }
+    @Override public int query()             { return 999; }
+}
 ~~~
 
-运行后你会发现：**根本没有写代理类**，但确实多了一个能打印日志的代理对象！
+你写的匿名内部类就是 InvocationHandler，Proxy.newProxyInstance 自动生成了一个 $Proxy0 类，它把所有接口方法都转发到你的这个匿名内部类的 invoke 方法。
 
-- Proxy.newProxyInstance 内部用了反射拿到所有接口的 Method 数组
-- 生成的代理类里每个方法都是：handler.invoke(this, Method对象, args)
-- 真正执行目标方法时，必须用 method.invoke(target, args) → 这就是反射
+所以你看到的所有 proxy.add(...) 实际上执行的是：
+~~~ java
+handler.invoke(proxy, add方法, new Object[]{"张三"})
+~~~
 
-**总结**：JDK 动态代理的核心是 Proxy.newProxyInstance，它会在运行时**根据接口动态生成一个实现类的字节码**（继承 Proxy，实现你的接口），然后加载到 JVM。生成的代理对象里所有方法最终都会走到你传入的 InvocationHandler 的 invoke 方法里。我们在 invoke 里通过 method.invoke(target, args) 使用反射调用真实对象的方法，并在调用前后加入增强逻辑。这就是 Spring AOP、MyBatis Mapper 接口、Dubbo 接口调用等框架实现切面的底层原理。
 
-可以说：没有反射就没有动态代理，没有动态代理就没有 Spring AOP、MyBatis Mapper 接口、Dubbo 接口调用这些现代 Java 框架的核心特性。
+**总结：**
+**JDK 代理的对象需要实现一个接口，原理：JVM 自动生成一个继承 Proxy、实现你接口的类，所有方法都转发到你写的匿名内部类的 invoke 方法里。**
 
+##### cglib 代理
+
+
+~~~ java
+import net.sf.cglib.proxy.Enhancer;
+import net.sf.cglib.proxy.MethodInterceptor;
+import net.sf.cglib.proxy.MethodProxy;
+
+public class CglibDynamicProxyDemo {
+
+    public static void main(String[] args) {
+
+        // 1. 真实对象（注意：这个类没有实现任何接口！）
+        UserService real = new UserService();
+
+        // 2. 用 CGLIB 创建代理
+        UserService proxy = (UserService) Enhancer.create(
+            UserService.class,                     // 要代理的类（父类）
+            new MethodInterceptor() {              // ← 匿名内部类！这就是核心
+                @Override
+                public Object intercept(Object obj, Method method, 
+                                        Object[] args, MethodProxy proxy) throws Throwable {
+                    
+                    System.out.println("【CGLIB 代理】方法开始: " + method.getName());
+                    long start = System.nanoTime();
+                    
+                    // 调用父类（真实对象）的方法
+                    Object result = proxy.invokeSuper(obj, args);
+                    
+                    System.out.println("【CGLIB 代理】方法结束，耗时: " 
+                        + (System.nanoTime() - start) / 1000 + "μs");
+                    return result;
+                }
+            }
+        );
+
+        // 3. 使用代理对象
+        proxy.add("李四");     // 看起来是普通方法，其实走的 intercept
+        proxy.query();
+    }
+}
+
+// 注意：这个类完全没有实现接口！
+class UserService {
+    public void add(String name) {
+        System.out.println("真实添加用户: " + name);
+    }
+    public int query() {
+        System.out.println("真实查询用户");
+        return 888;
+    }
+}
+~~~
+
+你写的匿名内部类实现了 MethodInterceptor,CGLIB 自动生成了一个类：UserService$$EnhancerByCGLIB$$123456，这个类继承了你的 UserService，它重写了所有非 final 方法，内容是：
+~~~ java
+public void add(String name) {
+    interceptor.intercept(this, add方法, args, fastProxy);
+}
+~~~
+
+总结：**CGLIB 自动生成一个子类，把所有方法都重定向到你写的匿名内部类的 intercept 方法里。**
+
+JDK代理使用字节码生成技术+反射，cglib 代理使用字节码生成技术，相应原理如下图：
+
+![alt text](/Java/Java基础/img/image-4.png)
+
+#### （5）单例设计模式
+
+下面是经典的防止反射（调用私有化构造方法）和反序列化破坏单例模式的一个单例写法：
+~~~ java
+public class Singleton {
+
+    private Singleton() {
+        // 防止通过反射破解
+        if (SingletonHolder.instance != null) {
+            throw new RuntimeException("单例已被破坏！");
+        }
+    }
+
+    // 静态内部类，只有在使用时才加载
+    private static class SingletonHolder {
+        private static final Singleton instance = new Singleton();
+    }
+
+    public static Singleton getInstance() {
+        return SingletonHolder.instance;
+    }
+
+    /**
+     * 防止序列化破解单例，反序列化时会优先调用这个方法返回实例
+     * @return
+     */
+    private Object readResolve() {
+        return SingletonHolder.instance;
+    }
+
+}
+~~~
+
+使用枚举的写法来写单例，可以最简单得实现单例，而且可以避免反射和反序列化对单例的破坏。
+
+- JVM 特别规定：java.lang.Enum 的构造器根本不允许反射调用。
+调用 constructor.newInstance() 会直接抛 IllegalArgumentException: Cannot reflectively create enum instances
+
+- JVM 特别规定：反序列化枚举时，根本不调用任何构造器，
+直接通过 Enum.valueOf() 根据名字返回已存在的常量，永远是同一个对象
