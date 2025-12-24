@@ -199,17 +199,64 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 - 事件就绪：硬件中断（如数据到达）触发内核检查 fd，通知进程。
 - 处理事件：进程获取就绪 fd，执行读写（非阻塞模式下立即返回）。
 
-#### （4）与其他 IO 模型的关系
+#### （4）与 IO 模型的关系
 
 - BIO：无多路复用，阻塞式。
 - NIO：依赖多路复用（Selector 用 epoll），非阻塞同步。
 - AIO：异步 + 多路复用（内核回调），但底层仍用 epoll-like 机制。
 
+![alt text](/Java/Java基础/img/image-3.png)
+
+**一句话总结**：Linux 内核提供了三种 I/O 多路复用机制：select → poll → epoll，它们本质是『就绪事件通知机制』，决定了内核如何高效地把『哪些 fd 可读/可写』告知用户态进程。
+
+Java NIO 的 Selector 是一个跨平台抽象层，在 Linux 上会自动选择当前最优机制（2.6+ 以后 99.99% 走 epoll），所以我们说『Java NIO 在 Linux 上本质就是 epoll』。
+
+正是因为 epoll 支持 O(1) 事件通知 + 不限制 fd 数量，才让一个线程能轻松管理几万甚至十几万长连接，Netty、Redis、Nginx、Go 的 netpoll 也都是基于 epoll 实现的。
+
 #### （5）文件描述符
 
 文件描述符（File Descriptor，简称 fd）是操作系统中一个核心概念，**用于标识和管理打开的文件或资源**。它本质上是一个非负整数（通常从 0 开始），由内核分配给进程，用于访问底层资源（如**文件、套接字、管道、设备等**）。在 Unix-like 系统（如 Linux、macOS）和 Windows（称为句柄）中，fd 是进程与内核交互的“句柄”或“索引”。
 
-### 4、反射
+### 4、高性能本地通信全链路
+
+Unix Domain Socket（简称 UDS）：在同一台机器上进程间通信（IPC）用的“本地版 Socket”，比 TCP 更快、更安全。
+
+它长得和普通 Socket 一模一样（有 socket()、bind()、listen()、accept()、connect()、send()、recv()），区别是地址不是 “IP + 端口”，而是一个文件路径（比如 /tmp/mysocket.sock），数据根本不走网络协议栈，直接在内核里拷贝，彻底不经过网卡。
+
+
+#### （1）Java 层（I/O 模型）
+- BIO / NIO / AIO：仅决定「一个线程能处理多少连接」
+  - BIO：同步阻塞（一个线程管一个连接）
+  - NIO：同步非阻塞 + Selector（一个线程管几千连接）
+  - AIO：真异步（内核通知）
+
+#### （2）Java 网络类（封装层）
+java.net.Socket（BIO） / SocketChannel（NIO）
+  → 实际是对操作系统 socket(2) 系统调用的面向对象封装
+  → 关键点：可以选择协议族（Java 16+ 正式支持）
+    - AF_INET / AF_INET6 → TCP/IP
+    - AF_UNIX → Unix Domain Socket（.sock）
+
+#### （3）操作系统层（决定真实链路）
+
+| 目标场景           | 协议族       | 完整调用链路（举例连本地 MySQL）                                                                 | 是否走网卡 | 典型延迟 |
+|--------------------|--------------|--------------------------------------------------------------------------------------------------|------------|----------|
+| 本机 TCP（最常见） | AF_INET      | 程序 → Java Socket → JNI → socket(AF_INET) → TCP 三次握手 → lo 回环虚拟网卡 → TCP 协议栈 → mysqld | 是（虚拟网卡） | 0.6~1.2ms |
+| 本机 .sock（最快） | AF_UNIX      | 程序 → Java SocketChannel → JNI → socket(AF_UNIX) → 内核内存直接拷贝 → mysqld                   | 否         | 0.18~0.35ms |
+| 跨机器 TCP         | AF_INET      | 程序 → Java Socket → JNI → socket(AF_INET) → TCP 三次握手 → 真实网卡 → 路由 → 目标机器 TCP 栈 → 目标进程 | 是（真实网卡） | 1~几十ms |
+
+#### （4）跨机器调用链路
+程序 → Java Socket → JNI → socket(AF_INET) → TCP 三次握手 → 真实网卡 → 交换机/路由器 → 目标机器网卡 → 目标机器 TCP 协议栈 → 目标进程
+
+#### （5）性能排序（同机场景）
+.sock（AF_UNIX）  >  127.0.0.1 TCP（回环）  >>  真实网卡 TCP
+
+
+金句结论：
+“本地通信天花板永远是 Unix Domain Socket（.sock），比 127.0.0.1 + TCP 快 2~4 倍，JDK16+ 已原生支持，生产强烈建议使用。”
+
+
+### 5、反射
 
 #### （1）反射原理
 
