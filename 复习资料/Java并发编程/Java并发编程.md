@@ -114,13 +114,13 @@ public class DateUtil {
 - ScheduledThreadPoolExecutor
 
 他们之间的关系如下图：
-![alt text](/Java/Java并发编程/img/image.png)
+![alt text](/复习资料/Java并发编程/img/image.png)
 
 FixedThreadPool、SingleThreadExecutor、CachedThreadPool 并不是类名（在标准 API 中），它们是 Executors 工厂类生产出来的特定配置的 ThreadPoolExecutor 对象，返回使用一个ExecutorService对象承接，生产环境通常禁止使用它，建议直接 new ThreadPoolExecutor。
 
 示例源码如下：
 
-![alt text](/Java/Java并发编程/img/image-1.png)
+![alt text](/复习资料/Java并发编程/img/image-1.png)
 
 ### 6、JUC 总结图谱
 
