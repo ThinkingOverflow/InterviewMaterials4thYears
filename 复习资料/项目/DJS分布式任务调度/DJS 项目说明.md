@@ -483,6 +483,90 @@ graph TD
     A3 -- 刷盘 --> DB2
 ```
 
+## 2、GNC XXL-Job 架构相关问题
+
+### Q1：GNC 任务调度定位以及其与原生 xxl-job 的区别
+#### （1）GNC XXL-JOB 的定位
+
+> 公司将原生 xxl-job 从单一调度中心形态，扩展成了一个多地域部署的云原生调度平台。平台把控制面、调度器、执行器 SDK、全局路由、权限鉴权、中转触发、外部代理等能力拆成了多个服务，并与应用管理平台、权限中心、API 网关、K8S 服务体系做了集成。
+
+#### （2）GNC 平台相对原生 XXL-JOB 的关键升级（逐步补充）
+
+##### （1）`多地域 + 多环境物理隔离`
+
+
+
+
+
+
+### Q2：GNC XXL-JOB 架构
+
+从部署图看，GNC 平台可以分成 4 层：
+
+#### （1）第一层：全局入口层
+
+**（1）console-cloud：中立云统一工作台。**
+
+给用户提供产品入口、登录态、租户信息，以及 region、env 、系统的选择能力。它本身不负责调度业务，只负责承接用户入口和上下文。
+
+**（2）APISIX 全局网关入口。**
+
+负责把来自 console-cloud 的请求按路径转发到对应服务，比如把“根据区域+环境获取前端入口配置”的请求转给 region-service，把后续业务请求转给对应区域前端。
+
+或者是， portal 根据 region+env+systemCode 返回需要路由的 dashboard 信息后，也需要提供 Apisix 进展转发。
+
+**（3）gnc-djs-region-service 区域入口目录服务**
+
+根据配置返回“某个 region / env 对应的前端入口地址”。主要解决“用户选了佛山生产后，前端资源该去哪里加载”的问题。
+
+**（4）gnc-djs-portal DJS 的系统级路由与代理层。**
+
+不是简单按 region+env 路由，而是按 region+env+systemCode 决定请求应该落到哪个 dashboard 集群。
+在当前单 dashboard 场景下它的作用不明显，但它为多 dashboard、多系统绑定、后续切换预留了统一路由层。
+
+**（5）请求路线串联**
+
+**用户先在 console-cloud 里选择地域和环境，请求通过 APISIX/bizgw-cloud 先访问 gnc-djs-region-service，拿到该 region+env 对应的前端入口并加载对应区域的前端资源。**
+
+**进入 DJS 后，若后续请求需要按系统维度确定实际 dashboard 集群，则再经过 gnc-djs-portal，由它按 region+env+systemCode 将请求代理或路由到真正的区域 dashboard。然后要找到对应的 dashboard 的服务，也需要通过 Apisix 进行转发。**
+
+#### （2）第二层：区域控制面
+
+**（1）t-djs-gnc-dashboard-front**
+
+区域内的前端静态资源服务，负责承载 DJS 管理界面页面，比如任务管理、执行器管理、日志查询、标签、告警等页面。
+
+**（2）gnc-djs-dashboard**
+
+区域控制面的核心后端服务。提供任务、执行器、标签、告警、API Key、系统配置等管理接口。负责控制台数据查询、任务配置变更、执行器管理、日志查询、统计展示等管理能力。同时还承担一部分后台管理任务，比如日志清理、统计汇总、巡检、主节点后台任务等。
+
+**（3）MariaDB**
+
+区域控制面的核心持久化数据库。保存该区域内的任务定义、执行器信息、系统信息、日志分表、统计表、标签、告警、权限、区域配置等数据。它是这个区域 dashboard 的核心数据来源。
+
+**（4）Redis**
+
+这里 Redis 有如下作用：
+
+- 控制面主节点选举与续约（Dashboard）
+- 调度器集群主节点选举与分片状态
+- 权限、角色等高频访问的数据缓存，减少频繁查 DB
+- 分布式锁：避免多实例重复执行同一后台任务/事件处理
+- 路由策略状态共享，把路由计数/访问顺序放 Redis，保证多调度实例下路由策略一致。
+
+这一部分可参考下面的问题分析
+
+
+**（5）总结**
+
+这一层负责“区域内所有调度管理能力的控制面闭环”：前端负责展示和交互，dashboard 负责业务管理逻辑，MariaDB 负责持久化元数据和日志数据，Redis 负责缓存与协同支撑，共同组成某个区域独立运行的 DJS 控制后台。
+
+
+
+
+
+
+### Q3：
 
 
 
@@ -495,52 +579,62 @@ graph TD
 
 
 
+## 3、GNC XXL-JOB 细节问题汇总
+
+### Q1：为什么不沿用单体 admin，而要拆成 dashboard 和 schedule？
+
+原生 admin 同时承担“控制面管理”和“调度执行面”职责，云原生多区域、多环境下会出现资源争抢和故障互相放大。
+
+我们拆成两层：
+- dashboard：控制台与治理面，负责任务配置、执行器管理、权限、告警、统计、日志清理、审计归档等。
+
+- schedule（trigger）：调度执行引擎，负责扫描到期任务、路由执行器、触发执行、接收回调、维护注册心跳状态。
+
+**协作链路**：用户在 dashboard 配任务入库 -> schedule 扫库并触发 worker -> worker 回调 schedule 更新执行结果 -> dashboard 提供查询与治理能力。
+
+**设计收益：**
+- 控制面与调度面解耦，控制台慢查询/报表不直接拖垮调度主链路，实现故障域隔离
+- 调度压力大时只扩 schedule pod；控制台不用跟着扩
+- 技术演进更灵活：调度策略、分片、路由可独立演进
+
+### Q2：Schedule 多 Pod 下任务如何分配？Pod 上下线如何感知？为什么还要选主，如何选主？
+
+分配任务给 schedule 节点的时候，**我们使用：“分桶分片”**：
+
+- 任务先算 job_hash = jobId % 256（固定 256 桶）。
+- 在线调度实例集合变化时，触发重分片，把 256 桶均匀分给各实例（Redis Set 到每个实例 key：trigger:active:<instanceKey>）。
+- 每个实例只扫描自己桶内的任务（SQL 条件是 job_hash in 我的桶集合），从根上避免全量重复扫库。
+
+**Pod 感知机制：**
+- 每个 schedule 实例启动后持续注册/续心跳，会将其心跳信息上传到 djs_job_registry 表（TrigInst 类型）。
+- 争抢 Redis key（5s 过期），来选主，master 周期检查实例心跳超时，判定上下线，将超时的 schedule 节点剔除，这个时候会触发256 个桶重新分配，因为 schedule 的数量发生变化，每个实例仍只扫描自己桶内的任务。。
 
 
+### Q3：Dashboard 为什么要选主？选主方式与原生 xxl-job 选主有何区别与优势？
 
+dashboard 有大量**治理型定时任务**（失败/过期任务处理、日志清理、统计上报、审计归档等），如果多 pod 同时执行会重复告警、重复归档、重复清理。
 
+因此 dashboard **采用 Redis 租约选主**：
+- 每个 dashboard pod 周期（10s）读 Redis key dashboard_master_node，若不存在或值等于自己，就写入自己并设置 TTL=30 秒，并把本机 isMasterNode=true
 
+- 非 master 节点只做服务请求，不跑 master-only 定时任务（失败任务处理、漏调扫描、归档、统计、清理等）
 
+- master 宕机后，不再续约，key 过期，其他 pod 可接管
 
+**与原生区别：**
 
+- 原生 xxl-job 主要通过 DB 悲观锁（xxl_job_lock.schedule_lock）保证“调度扫描单活”。
 
+- 我们是“dashboard Redis 选主 + 调度面分片并行 + 使用 Redis 选 master 来管理 schedule 心跳以及协调分片”，不是单一全局锁模型。
 
+### Q4：梳理出 schedule 调度任务的链路
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- schedule 实例启动后注册自己（TrigInst）并续心跳到 djs_job_registry
+- 实例选主后，master 维护在线实例集合，实例变化时重分 256 桶。
+- 分片结果写 Redis：每个实例一个 key，key 形如 trigger:active:<instanceKey>，value 是 Redis Set，元素是桶号整数。
+- 每个 schedule 扫描前先从 Redis 读自己的桶集合，扫库查 djs_job_info：job_hash in (我的桶集合) 且 trigger_next_time 到期窗口内，然后对命中的任务做预读/触发（含 misfire、时间轮推进、立即触发）
+- 触发时按路由策略选执行器地址（执行器地址来自注册信息与执行器配置），下发到 worker
+- worker 执行后回调 schedule 更新日志与状态；若找不到 handler 会返回失败并进入失败处理链路。
 
 
 

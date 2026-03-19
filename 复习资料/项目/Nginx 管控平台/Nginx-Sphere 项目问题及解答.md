@@ -1451,7 +1451,23 @@ Nginx 高并发主要依赖三大基石：
 
 - **第二层破局**：利用 K8s 原生特性打穿『容器隔离墙』。通过共享文件系统+共享进程空间，实现 agent 对配置的可见性，以及 agent 可通过 pid 向 nginx 进程下发指令。
 
+### Q6：VM vs 服务化 NATS 通信 Topic 差异剖析
 
+#### 在虚拟机 (VM) 场景下
+
+- **Admin -> Agent (指令下发)**：Admin 会取 lb_basic_info 表里的 nginxInstanceId 字段作为 NATS 发布的主题 Topic。比如主题名是 05b38ed6a...。
+
+- **Agent 行为**：Agent 启动时，就会向 NATS 注册并常驻监听自己被分配的 nginxInstanceId 主题。
+
+- **Agent -> Admin (回执响应)**：Admin 发送请求时，除了向上述主题发消息，还会在报文里带上一个生成的临时唯一单号（uid）。当 Agent 处理完动作后，它就将这个 uid 作为 Topic，向 NATS 发送处理结果报文。由于 Admin 提前订阅了这个 uid 为 Topic 的信道，所以能精准摘取该次的反馈执行回执。
+
+#### 在服务化 (Serverless/Container) 场景下
+
+- **Admin -> Agent (指令下发)**：为了区分不同集群里的不同 Pod，防止消息串台乱窜，服务化环境抛弃了虚机那套单一的 nginxInstanceId。它采用了一套组合键规则，将下行 Topic 强行定义为了 clusterId_podIp（集群实例ID拼接下划线和目标 Pod 的 IP，比如：cluster-xyz_10.12.33.4）。我在 executeContainerOperation 代码中也使用这个规则拼装了发送通道（trick 式地把 Topic 塞进了 nginxInstanceId 模型字段发往 NATS）。
+
+- **Agent 行为**：容器启动时获取到所属集群与本机 IP 后，就以此组合字符串向 NATS 动态长轮询监听这个带标识的组合 Channel。
+
+- **Agent -> Admin (回执响应)**：应答机制与虚拟机完全一致。依然是 Admin 发送报文附带临时任务单号 uid，容器内 Agent 将执行成功或报错日志封装好后，发布到以 uid 为名的新主题上，使得控制平面可以完成多节点的 .join() 和聚合结果呈现。
 
 
 
