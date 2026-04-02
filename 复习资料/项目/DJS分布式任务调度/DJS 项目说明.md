@@ -490,15 +490,6 @@ graph TD
 
 > 公司将原生 xxl-job 从单一调度中心形态，扩展成了一个多地域部署的云原生调度平台。平台把控制面、调度器、执行器 SDK、全局路由、权限鉴权、中转触发、外部代理等能力拆成了多个服务，并与应用管理平台、权限中心、API 网关、K8S 服务体系做了集成。
 
-#### （2）GNC 平台相对原生 XXL-JOB 的关键升级（逐步补充）
-
-##### （1）`多地域 + 多环境物理隔离`
-
-
-
-
-
-
 ### Q2：GNC XXL-JOB 架构
 
 从部署图看，GNC 平台可以分成 4 层：
@@ -1382,54 +1373,216 @@ GNC 版本的日志进行了如下优化：
 - **归档时机**：每天凌晨归档 T-1 到 OSS（压缩存储）。
 - **删除时机**：不是归档完立刻删，建议“归档成功 + 校验通过 + 过观察期”后再删。观察期建议：7 天（稳妥），再执行物理删除。
 
+### Q17：client-SDK 的优雅下线逻辑的全过程
+
+- 收到下线信号：建议使用更新负载而不是销毁重建（因为 SDK 有优雅下线的逻辑）
+  - 应用收到 K8s SIGTERM / Spring 容器关闭事件，触发 SDK 的销毁流程。
+
+- 先摘除注册
+  - SDK 停止心跳上报，并调用 registryRemove 把当前 worker 地址从注册中心移除，避免新调度再打到这个实例。
+- 等待在途任务收敛
+  - 不再接收新任务，等待正在执行的任务完成（或到达超时上限），尽量避免任务中断。
+- 最终退出进程
+  - 清理线程池/连接资源后退出，调度侧因心跳消失也会把该实例判定为离线。
+
+## 4、Paas  XXL-Job 分析
+
+Paas 可以理解为：**把原生 xxl-job admin 拆成管理面（center）+ 调度面（api）+ 平台治理执行器（executor）+ SDK（core）**，其中调度面内部用 Akka 感知节点变化、Redis 保存任务分片。
+
+### Q1：Paas 各模块功能
+
+#### （1）`djs-dispatch-center`（Paas）
+
+功能：
+
+- 控制台入口，提供系统组/执行器/任务管理
+- 负责权限、用户、操作审计、CMDB 同步等管理能力
+- 为前端页面提供管理接口，不承担核心触发扫描
+
+在 GNC 中相当于：
+
+- `gnc-djs-dashboard`（控制台 + 管理接口）
+
+#### （2）`djs-dispatch-api`（Paas）
+
+功能：
+
+- 调度核心：预读任务、时间轮触发、路由下发、失败重试
+- 节点协同：**使用 Akka 集群事件 + Redis 任务集合分片**
+- 调度日志写入与状态更新
+
+在 GNC 中相当于：
+
+- `scheduler-trigger/scheduler` 主调度服务（你现在讲的 Schedule 侧核心）
+
+#### （3）`djs-dispatch-executor`（Paas）
+
+功能：
+
+- 运行平台内部 XXL 任务
+- 包括 `processJobLogReport`、`statisticalJobLogReport`、数据修复等
+
+在 GNC 中相当于：
+
+- dashboard/scheduler 内部的治理性定时任务集合（报表、清理、修复）
+
+#### （4）`djs-core (midea-djs-core)`（Paas SDK）
+
+功能：
+
+- 业务应用接入 SDK，扫描 `@XxlJob`
+- 注册执行器心跳、回调执行结果、优雅下线
+- 处理 VM/K8s/VPC 等地址推导
+
+在 GNC 中相当于：
+
+- `scheduler-client-spring-boot-starter`（主线 client-SDK）
+
+#### （5）`schedulder-hub`（Paas）
+
+功能：
+
+- 在调度器与执行器网络不互通时做中转
+- 承接触发、停止、日志查看、连通性探测
+
+在 GNC 中相当于：
+
+- `gnc-djs-xxl-rpc-hub-*`（后续逐步兼容到 gRPC 主链路 + hub）
 
 
+### Q2：Paas DJS 主链路
+
+#### （1）控制台管理链路
+
+1. 用户访问 `djs-dispatch-center`
+2. 在控制台配置执行器、任务、告警策略
+3. 主数据落库：`djs_job_system/djs_job_actuator/djs_job_info/...`
+
+#### （2）执行器注册链路（SDK）
+
+1. 业务服务引入 `midea-djs-core`
+2. 应用启动后 `ExecutorRegistryThread` 周期上报注册
+3. `dispatch-api` 处理注册请求并写 `djs_job_registry`
+4. 聚合更新 `djs_job_actuator_version.address_list`
+
+#### （3）调度触发链路（核心）
+
+1. `JobScheduleHelper` 预读未来 5 秒任务
+2. `JobRingHelper` 到秒触发
+3. `JobTriggerPoolHelper` 异步下发触发
+4. `XxlJobTrigger` 选路并调用执行器（直连或 hub）
+5. 记录 `djs_job_log`；失败写 `djs_job_log_failure`
+6. 回调后更新 handle 状态，驱动告警/重试
 
 
+### Q3：使用 Akka 对调度器（api模块）进行分片
 
+#### （1）什么是 Akka，原理是什么？
 
+Akka 是一个基于 Actor Model 的并发/分布式框架，核心思想是“消息驱动”，不是共享内存。Akka 可用于构建高并发、分布式、弹性（容错）和响应式的应用程序。
 
+Akka 的核心原理是 Actor 模型：
+- 基本单元：以 Actor 为最小计算单元。每个 Actor 封装了**私有状态和行为逻辑**。
+- 通信机制：Actor 之间 不共享内存，仅通过 **异步、非阻塞**的消息传递 进行通信。消息被投递到接收 Actor 的“邮箱”（Mailbox）中。
+- 执行模型：每个 Actor 一次只处理一条消息，这保证了其内部状态的线程安全，开发者无需使用锁或同步原语。
+- 容错设计：采用 层级监督（Hierarchical Supervision） 策略。父 Actor 负责监控子 Actor，当子 Actor 发生故障时，父 Actor 可以选择重启、恢复或终止它，从而实现系统的自我修复能力。
+- 轻量高效：Actor 非常轻量（1GB 内存可容纳数百万个），其调度由 Akka 的 dispatcher 在少量 OS 线程上完成，避免了传统线程的高昂开销。
 
+一句话概括：**Akka 通过“隔离状态 + 消息驱动”的 Actor 模型，将复杂的并发与分布式问题，简化为单线程式的顺序编程。**
 
+**用途：**
+- 本地层面，Akka 用 Actor + Mailbox + Dispatcher 来做高并发异步处理，减少锁竞争。
+- 集群层面，Akka Cluster 提供成员发现、成员状态变更事件（MemberUp/Down/Removed/Unreachable）、leader 选举和故障感知。
+- 典型用途是**分布式节点协同：节点上下线感知、任务分片再平衡、故障切换触发**
 
+#### （2）Akka 在 Paas 里面的作用与原理
 
+**Akka 在 Paas 的作用是做调度节点成员变更感知**。某个 API 节点上线/下线/不可达时，这个 API 服务上的Akka Cluster 会广播成员事件，其他节点的 ClusterWatcher 监听到后触发 JobShardHelper。多个节点会竞争分布式锁，抢到锁的节点负责本轮重分片，把分片结果写回 Redis（cluster:nodes、job:active:{node}）。每个 API 节点只扫描并调度自己分片里的任务，从而避免重复调度。
 
+这里有 2 个点要注意：
+- 不是“抢到锁就成为主节点”，而是“抢到本次重分片执行权”。
+- 重新分片的时候，Akka 按数据库运行任务集合 + 各节点当前分片集合，计算增量迁移并更新 Redis 分片 key
 
+##### （1）节点上下线感知，是什么意思
 
+每个 dispatch-api 实例启动后都会加入 Akka Cluster（ActorManager 初始化）。系统里有个 ClusterWatcher 在订阅 Akka 事件。一旦集群成员变化，Akka 会发事件：
+- MemberUp：某节点上线
+- MemberLeft：优雅下线
+- MemberDowned：异常不可达后被判定下线
 
+ClusterWatcher 收到事件后，不做业务调度，只调用 JobShardHelper.memberUp/memberDown。你可以理解为：Akka 负责“发现变更并通知”，JobShardHelper 负责“真正改分片”。
 
+##### （2）任务分片再平衡，是什么意思
 
+再平衡就是：集群节点数量变了，原来分配给每个节点的任务数量不均衡了，要重新分配。
 
+Paas 用 Redis 存分片状态：
+- cluster:nodes：当前调度节点列表。
+- job:active:full：全量运行任务集合。
+- job:active:{node}：某个节点负责的 jobId 集合。
 
+节点上线时（MemberUp）
+- 抢分布式锁（akka_member_up），避免多个节点同时重分片。
+- 把新节点加入 cluster:nodes。
+- 从老节点的 job:active:{oldNode} 中搬一部分任务到 job:active:{newNode}，目标是接近平均。
+- 设置“分片完成通知”标记，其他节点刷新本地缓存。
 
+节点下线时（MemberLeft/Downed）
+- 抢分布式锁（akka_member_down）。
+- 取下线节点的 job:active:{downNode}。
+- 把这些任务均匀分给剩余节点的 job:active:{aliveNode}。
+- 从 cluster:nodes 删除下线节点并清理其分片 key。
 
+##### （3）故障切换触发，是什么意思
 
+故障切换不是“主从切换”那种强一致语义，这里是“节点挂了，任务归属切到活节点”。分为 2 种情况：
 
+- 优雅下线（正常停机）
+  - 节点会先走 leave 流程。
+  - 集群里其他节点会收到 MemberLeft -> MemberExited -> MemberRemoved 这类事件。
 
+- 异常下线（宕机/断网）
+  - 下线节点发不出任何消息。
+  - 其他节点靠 Akka 的失败检测（心跳 + phi detector）判定它 Unreachable。
+  - 若配置了 auto-down-unreachable-after（你们是 15s），到时间后会把它 Downed/Removed，然后 ClusterWatcher 才收到对应事件并触发重分片。
 
+**优雅下线靠主动离群事件，异常下线靠其余节点“检测不到心跳”后被动判定。**
 
+##### （4）如何确保 Redis 里面的任务数据是最新的
 
+在你们 Paas 里主要有两层保证：
 
+**JobShardHelper.toRun() 每 5 秒做一次对账**
+  - 从 MySQL 拉“当前应运行任务集合”（allRunningJobsInDatabase()）
+  - 和 Redis 的 job:active:* 做 diff：
+  - DB 有、Redis 没有 -> 补到分片
+  - Redis 有、DB 没有 -> 从分片移除
+  - 同时处理任务启停变更（findByChangeJob）
 
+**每个节点本地缓存也会刷新**
+  - 节点根据自己的 job:active:{node} 去 DB 拉任务详情，更新本地 jobInfoMap
+  - 分片变更或任务配置变更时会触发刷新线程重新加载
 
+即每 5s 拉取 mysql 任务与 Redis 对比，同时每次重新分片回去 MySQL 拉取最新的任务数据。
 
+#### （3）Akka 相对于原生 xxl-job 的优点与缺点
 
+原生 XXL-JOB 是通过抢 MySQL 锁表（xxl_job_lock，通常是 schedule_lock）来保证：
+- 同一时刻只有一个 admin 实例执行“调度扫描”（扫即将触发任务、写时间轮）。
+- 避免多 admin 并发扫表导致重复触发。
+也就是：这个锁本质是“调度扫描单活锁”。
 
+**优势：**
+- **降低 admin 单点压力**：从“一个 admin 主扛”变为“集群分担调度压力”，每个调度节点只处理 job:active:{node} 分片，避免多节点重复扫描。
+- **节点变化事件快速感知，扩缩容更平滑**：Akka 直接感知调度节点上下线，触发重分片，比纯 DB 轮询更实时。节点新加入即可参与分担任务，不需要长时间等锁轮转。
+- **故障切换更快**：节点 down 后可按事件触发迁移分片，恢复速度通常优于单纯依赖 DB 协调。
 
+**缺点：**
+- 运维复杂度上升：排障要同时看 Akka 事件、Redis 分片、调度线程状态。
+- 脑裂风险：网络分区时可能形成多个子集群。
+- 分片状态一致性风险：Akka 事件与 Redis 状态若不同步，会出现任务倾斜/漏触发。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+### Q4：出现的生产问题案例
 
 
 
