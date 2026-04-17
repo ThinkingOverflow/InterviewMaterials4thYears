@@ -134,7 +134,7 @@
 把它们串起来，就是：
 - 用户传入模型名
 - 平台先按模型族找到对应适配器
-- 适配器再从这个模型的资源池里选一条资源配置
+- 适配器再从这个模型的资源池里选一条资源配置（token制或者席位制，常规使用 token，小龙虾/agent使用席位制）
 - 如果该资源后面还有多个厂商账号/client，再继续选最终执行端；最后才真正发请求到上游模型
 
 拿 Claude 举例最容易讲：
@@ -153,11 +153,55 @@
 
 适配器确定后，还要决定“用哪个真实账号/URL/API Key 发请求”。有两条路径：
 - 普通资源池：chat.resource 里按 modelKey 选 ChatGptConfig（含 modelkey、apikey、url等调用信息）
-- 账号池/席位池：先按 appKey+model 找 poolCode，再在池里按**用户绑定、容量、冷却**等策略选具体资源。
+- 账号池/席位池：先按 appKey+model 找 poolCode，再在池里按**用户绑定、容量、冷却**等策略选具体资源。（席位池是最近新加的逻辑，目前只有`OpenAiExternalController`有，但是面试的时候可以说都覆盖了。）
 
-席位池是最近新加的逻辑，目前只有`OpenAiExternalController`有，但是面试的时候可以说都覆盖了。
+##### （2）普通资源池的选择原理
+厂商根据 token 来进行计费，其流程如下
 
-##### （2）一个真实的调用案例
+- 先从 chat.resource.config[] 中筛 enable=true 且 modelKey=当前模型 的资源候选（配置来源）
+- 再交给 LoadBalancer 选一条资源，你当前 SIT 配置是 chat.loadBalancer=quotaBased，即配额优先策略
+  - quotaBased 细节：先看 Redis 中该模型哪些 key 还有可用配额；若都超限则降级到候选集内“加权+粘性/随机”；粘性是 userId#modelKey 哈希，权重来自 weight（默认 1）
+    - 这里选还有可用配额的模型，选取 score >= maxTokens（maxTokens 不是固定值，取决于每次请求：常见是“预估输入 token + 请求的输出上限“）
+    - 如果可用集合为空（都超限），降级回基础候选集 configList 继续选，这里都超限还回退，意义在于它是可用性优先的软门控，不是硬拒绝，避免因为 Redis 短时不一致/重建窗口造成全量拒绝，业务可继续服务，后续再由预算/账单治理闭环，如果你要“严格超限即拒绝”，这是另一种策略，需要在入口直接 fail-fast。
+    - 粘性：offset = hash(userId#modelKey) % totalWeight，同一用户同模型尽量稳定命中同一路由区间，无粘性则随机偏移命中。权重：weight<=0 视为 1；按累计权重区间命中。
+  - apiKey 额度在 Redis ZSet 里，写入时机有两类：
+    - 初始化/重置：定时任务 recoverQuotaJob（一分钟执行一次） 每次会重建所有模型的 quota ZSet（先删后加，TTL 5 分钟）。初始额度来自枚举 AigcModelQuotaEnum，即会限制模型一分钟内最高调用的 token 数。
+    - 调用后扣减：每次调用保存记录时，会按本次 totalToken 对当前 modelKey + apiKey 的 score 做负向扣减。同时，也会记录用户的 token 使用量和费用情况并记录到数据库，然后每天有定时任务去采集数据做预算报表。这里需要注意的是，第一版是先使用（限额）后出报表之后再和用户收费用。
+    - TPM = Tokens Per Minute，每分钟可处理的 token 吞吐配额。
+
+##### （3）席位池的选择原理
+
+对厂商侧：厂商按人头卖 seat（每 seat 对应一个或少量可并发用户的 key 资源），我们把这些资源入池。**这里一个厂商提供的 seat 可以调用多种不同的模型，之前厂商提供的 token 也可以调用这个厂商提供的多种不同的模型。**
+
+对用户侧：用户只拿你们平台发的 API Key，完全不感知厂商 key；调用时平台按 appKey + model + user 去池里调度真实资源。
+
+资源数据模型（一行就是一个 seat 资源单元）在 openai_api_key_pool_resource：pool_code/api_key/api_url/model_configs/max_user_count/status/seat_code。model_configs 决定这个 seat 支持哪些模型，以及模型名映射和计费码映射。如下图：
+
+![alt text](/复习资料/项目/AIGC/img/image-2.png)
+
+并发控制靠 max_user_count 和 Redis 绑定/容量键实现，即“一个 seat 只能给 1 或少量用户”。
+
+管理面功能包含：资源详情 + 当前绑定用户数 + 当前绑定账号列表。这里 seat 的信息目前暂时是调用接口来入库的。
+
+**详细的调度流程：**
+
+- 请求进入 OpenAI 兼容入口，完成鉴权与治理校验，拿到 system(appKey) 和 userId。
+- 服务层先做“是否走席位池”的路由：按 appKey（systemcode） + modelKey -> poolCode。即查看这个系统及对应的模型名称是否有对应的资源池。如果存在，进入席位调度核心。
+- 第一步“先复用已绑定”：查 USER_BINDING_KEY，若绑定资源可用且支持当前模型，直接续约返回。
+- 第二步“亲和复用”：若无活跃绑定，尝试复用最近一次资源，减少抖动和切换成本。
+- 第三步“最空闲窗口抢占”：若亲和复用失败，从 CAPACITY_ZSET_KEY 取占用最小的前 N 个候选，过滤冷却/停用/不支持模型的资源，再随机取一个尝试占用。窗口和重试次数由配置控制。抢占用 Lua 原子执行，保证并发安全：同时更新 user->resource、resource->users、容量计数，并检查 max_user_count。
+- 抢占成功后，把资源组装为 ChatGptConfig 返回，包含 openAiPoolCode/openAiPoolResourceId、modelName、responseModelCode。
+- 上游调用时如果命中账号级 429，会把该资源冷却移出候选池，再抛可重试异常；入口层重试 1 次，通常会切到其他席位资源。
+
+**这里冷却一个 key 的具体机制是：**
+
+- 当上游返回 429 且判定为账号级限流，取当前资源的 poolCode + resourceId，调用 cooldownResource。
+- 冷却实现不是删数据，而是在容量 ZSet openai:pool:{pool}:cap 里把该 resourceId 的 score 设为负的冷却到期时间戳（-cooldownExpireAt）。
+- 调度候选只取 score >= 0 的资源，所以这个资源会暂时被排除，不再被选中。冷却时长默认 5 小时，可配置。
+- 后续 ensureCapacityRegistered/recoverExpiredCooldownResources 会把冷却到期资源恢复回候选池。（亲和复用失败需要选择一个可用的池资源的时候执行冷却到期恢复）
+
+
+##### （4）一个真实的调用案例
 
 这里`OpenAiExternalController`这个接口类为例，这个类是提供给小龙虾使用的。
 
@@ -169,11 +213,47 @@
 
 **汇总：先按模型选“哪类适配器代码”，再按策略选“哪条资源配置”，最后再落到“哪个真实账号/客户端”，这是三层路由，不是一层。**
 
+##### （5）Token 制 vs 席位制：各自好处
 
+Token 制 好处：
+- 成本与用量线性，按量计费清晰。
+- 高并发友好，一个厂商 key 可服务大量用户。
+- 接入与扩容简单，适合通用问答和大规模流量场景。
+- 对业务方几乎无“席位占用”心智负担。
 
+席位制 好处：
+- 适配厂商“按人头/席位”商业模型，采购与合规更匹配。
+- 资源隔离更强，可做用户绑定与并发上限控制，服务稳定性更可控。
+- 便于做账号池运营：启停、解绑、冷却、回收、容量管理。
+- 对高价值用户或特定场景可提供更稳定的资源保障。
+- 席位制用于小龙虾时省 10 倍费用
 
+**实践上通常是“双模并存”：**
+- 通用流量走 Token 制。
+- Coding/Agent 等强资源约束场景走席位制。
 
+##### （6）Claude->Bedrock 这类 SDK 场景的说明
 
+对于 apikey 下面还有一层的厂商，如`Claude->Bedrock`，请求的顺序如下：
+
+- 请求层（外部入参）：model/messages/stream/... 从接口进来，进入统一调用链。
+- 平台编排层：选 AigcApi 适配器（模型实现路由），Claude 模型走 Claude 适配器。
+- 资源层（ChatGptConfig）：常见字段：modelKey/apiKey/url/modelName/responseModelCode/...
+- Bedrock账号层（配置中心）：amazon.bedrock.configs[].name/awsAccessKeyId/awsSecretAccessKey/region/service/enabled
+- 这种模式需要引入 Claude SDK，先在配置中心维护 amazon.bedrock.configs（name/ak/sk/region/enabled），启动时根据配置初始化同步/异步 Bedrock client map，运行时按 AK 过滤 + 负载策略（随机，指定 name）选具体 client，用选中的 client 调 converse/converseStream。
+
+**总结：对于普通调用模式，是直接 HTTP url + Bearer apiKey 调上游，而Claude-Bedrock不是直接按 URL 发 HTTP，而是走 AWS SDK client（签名、region、credentials 都在 SDK 客户端里）。**
+
+##### （7）席位制请求返回429
+
+下游返回 429 且错误码是账号级限流，时，先把该资源打入冷却，再抛 OpenAiPoolRetryableException。入口层捕获后只重试一次，并在响应尚未提交时 reset() 后重调，这次会重新调度到其他资源。冷却实现是把资源从容量候选集中暂时移除。
+
+设计收益：
+- 减少用户侧直接失败
+- 避免同一个已限流账号被连续命中
+- 不做多次重试，控制尾延迟和放大效应
+
+这机制主要是席位/池化模式的稳定性保护，不是 token 模式的通用机制。
 
 
 
