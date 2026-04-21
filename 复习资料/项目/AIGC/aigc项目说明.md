@@ -488,6 +488,58 @@ flowchart TD
 
 一句话：**前者管“这套系统在这个时段总共能打多少”，后者管“这个用户今天在这个模型上还能打多少”。两层叠加是“总量保护 + 个体约束”。**
 
+##### （6）费用阈值检查 和 断流状态检查 的关系
+
+两个确实都“在控费用”，但本质不一样：
+
+- 费用阈值检查（在 flowControl/flowControlByTimes 里）是实时算账+动态拦截；
+- 断流状态检查（checkCutoff）是预先打标+开关式拦截。
+
+**费用阈值检查（动态）:**
+
+每次请求前会：
+- getConfigFee(system, model, now) 取该时段预算；
+- computeModelFee(...) 或 computeModelFeeByTimes(...) 读当日 usage/fee 缓存换算成本；
+- 超过阈值直接抛 CHAT_GPT_FEE_OVER_LIMIT。
+- 同时它还带“时段次数限流”（rateLimitPerMinute + 规则）并发告警。
+
+**断流状态检查（静态/策略开关）:**
+
+逻辑非常直接：只有当systemDto.isCutoff == 1 且 bill.manage.isCutoff == 1,才拦截并抛 CHAT_GPT_SYSTEM_CUTOFF_YES,它不做实时费用计算，只是读系统状态位
+
+isCutoff 通常由账务/欠费任务异步更新（例如 OverduePaymentAlertDayJob.java (line 194) 会把系统置为断流），而不是在请求线程里临时算出来。
+
+##### （7）限流与费用限制整体流程图
+
+**如下：先判断是否断流（超预算），然后判断时段是否超限制，最后实时判断费用是否超预算。**
+
+```mermaid
+flowchart TD
+    A["请求进入 Controller"] --> B["鉴权/模型权限等前置校验"]
+    B --> C["checkCutoff(systemDto)"]
+
+    C --> D{"isCutoff(systemDto)=1 且 bill.manage.isCutoff=1 ?"}
+    D -- "是" --> E["返回错误：CHAT_GPT_SYSTEM_CUTOFF_YES (9914)"]
+    D -- "否" --> F["flowControl(...) / flowControlByTimes(...)"]
+
+    F --> G["读取当日费用阈值 getConfigFee(...)"]
+    G --> H["计算当日费用 computeModelFee(...) 或 computeModelFeeByTimes(...)"]
+    H --> I["时段计数 + 阈值比较（每分钟/时段规则）"]
+
+    I --> J{"时段次数超限?"}
+    J -- "是" --> K["返回错误：CHAT_GPT_LIMITING"]
+    J -- "否" --> L{"费用超限?"}
+    L -- "是" --> M["返回错误：CHAT_GPT_FEE_OVER_LIMIT"]
+    L -- "否" --> N["进入上游模型调用"]
+
+    E --> Z["结束"]
+    K --> Z
+    M --> Z
+    N --> Z
+
+```
+
+
 ### Q3：鉴权+限流+调用流程串联
 
 2 个注意点：
@@ -620,6 +672,8 @@ flowchart LR
 
 如：`POST /external/sync/contextCompletions`，入口在 `ChatGptExternalController.java (line 77)`，实际同步调用在 `ChatGptServiceImpl.java (line 115)`。
 
+**这里，同步 chat直接 http 调用外部大模型的接口将结果封装返回给客户端。**
+
 
 ##### （2）SSE（流式）
 
@@ -629,6 +683,56 @@ flowchart LR
 （不用修改代码，只需要在请求加一个 Accept: text/event-stream，这样响应就会变成 SSE 流式）
 
 如：`POST /external/stream/contextCompletions`，入口在 `ChatGptExternalController.java (line 262)`，流式转发在 `ChatGptServiceImpl.java (line 192)（aigcApi.streamChatGpt(...)）`。
+
+这里，真正“边读边回传”发生在 `streamChatGpt 内部：
+- 从上游连接逐行读流：`BaseOpenAiServiceImpl.java (line 168)`
+- 每读到一段就写入当前 HTTP 响应输出流：
+`BaseOpenAiServiceImpl.java (line 197)`
+- `writeOutputStream` 里明确 `outputStream.write(...); outputStream.flush()`;：
+`BaseOpenAiServiceImpl.java (line 718)`
+- 方法返回的 `streamResponse` 是“最终态对象”，随后用于保存问答：`ChatGptServiceImpl.java (line 221)`
+
+所以整体是：实时回传靠 ServletOutputStream，返回对象主要给服务端日志/持久化。
+
+SSE 响应的流程图如下：
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant Ctrl as ChatGptExternalController
+    participant Svc as ChatGptServiceImpl
+    participant Api as AigcApi(BaseOpenAiServiceImpl)
+    participant Up as Upstream LLM
+    participant Resp as HttpServletResponse(OutputStream)
+    participant DB as Save/Log Service
+
+    C->>Ctrl: POST /external/stream/contextCompletions
+    Ctrl->>Ctrl: checkCutoff + flowControl + model权限校验
+    Ctrl->>Svc: contextCompletions(completionDto, httpServletResponse)
+
+    Svc->>Svc: 解析模型并选择AigcApi实现
+    Svc->>Resp: prepareResponseHeader(responseId)
+    Svc->>Api: streamChatGpt(completionDto, httpServletResponse)
+
+    Api->>Api: assembleContext + 选chatGptConfig
+    Api->>Up: HTTP POST(stream=true)
+    loop 上游持续返回分片
+        Up-->>Api: line(data: {...})
+        Api->>Api: 解析为streamResponse并累计messageTotal
+        Api->>Resp: write(JSON + "\n")
+        Api->>Resp: flush()
+    end
+    Api-->>Svc: return 最后一个streamResponse(汇总态)
+
+    Svc->>DB: saveLog(chatGptConfig, responseTime, streamResponse.id)
+    Svc->>Svc: streamResponse.setResponseId(responseId)
+    Svc->>Api: save(completionDto, streamResponse)
+    Api->>DB: 持久化问答/usage等
+    Svc-->>Ctrl: void
+    Ctrl-->>C: 连接结束（客户端已按分片实时收到内容）
+
+```
+
 
 ##### （3）WebSocket（双工）
 
@@ -674,17 +778,23 @@ flowchart LR
 **chat-app：请求即执行，重点是鉴权/限流/资源路由/实时返回。**
 **multimedia：任务状态机，重点是队列、锁、回调、结果持久化与重试。**
 
+### Q6：AigcApi 这里使用了什么设计模式，作用是什么？
 
+核心是 **策略模式 + 模板方法 + 适配器思路**
 
+**策略模式（按模型/厂商切实现）：**
 
+`ChatGptServiceImpl` 里通过 `Map<String, AigcApi> aigcApiMap` 取具体实现，再调用统一方法（`syncChatGpt/streamChatGpt/...`）。
 
+**模板方法（基类沉淀公共流程）**
 
+很多实现继承 BaseOpenAiServiceImpl，把“组包、选资源、发请求、流读取、落日志”等公共流程放基类，子类按模型差异**覆盖/扩展**。
 
+**适配器思路（统一多厂商能力面）**
 
+AigcApi 定义了统一入口，同时通过 default 方法覆盖不同协议能力（OpenAI/Gemini/DeepSeek/图像/视频等），把上游差异“适配”成统一调用面。
 
-
-
-
+好处：**平台通过 AigcApi 把平台能力面和厂商实现面解耦，新增模型时优先复用抽象和保存链路，只在适配层补厂商差异。**
 
 
 
