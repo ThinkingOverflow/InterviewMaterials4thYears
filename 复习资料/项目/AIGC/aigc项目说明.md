@@ -151,7 +151,7 @@
 
 ##### （1）资源池的绑定细节
 
-适配器确定后，还要决定“用哪个真实账号/URL/API Key 发请求”。有两条路径：zh
+适配器确定后，还要决定“用哪个真实账号/URL/API Key 发请求”。有两条路径：
 - **普通资源池**：chat.resource 里按 modelKey 选 ChatGptConfig（含 modelkey、apikey、url等调用信息）
 - **账号池/席位池**：先按 appKey+model 找 poolCode，再在池里按**用户绑定、容量、冷却**等策略选具体资源。（席位池是最近新加的逻辑，目前只有`OpenAiExternalController`有，但是面试的时候可以说都覆盖了。）
 
@@ -161,7 +161,7 @@
 - 先从 chat.resource.config[] 中筛 enable=true 且 modelKey=当前模型 的资源候选（配置来源）
 - 再交给 LoadBalancer 选一条资源，你当前 SIT 配置是 chat.loadBalancer=quotaBased，即配额优先策略
   - quotaBased 细节：先看 Redis 中该模型哪些 key 还有可用配额；若都超限则降级到候选集内“加权+粘性/随机”；粘性是 userId#modelKey 哈希，权重来自 weight（默认 1）
-    - 这里选还有可用配额的模型，选取 score >= maxTokens（maxTokens 不是固定值，取决于每次请求：常见是“预估输入 token + 请求的输出上限“）
+    - 这里选还有可用配额的模型，选取 score >= maxTokens（maxTokens 不是固定值，取决于每次请求：常见是“**预估输入 token + 请求的输出上限**“）
     - 如果可用集合为空（都超限），降级回基础候选集 configList 继续选，这里都超限还回退，意义在于它是可用性优先的软门控，不是硬拒绝，避免因为 Redis 短时不一致/重建窗口造成全量拒绝，业务可继续服务，后续再由预算/账单治理闭环，如果你要“严格超限即拒绝”，这是另一种策略，需要在入口直接 fail-fast。
     - 粘性：offset = hash(userId#modelKey) % totalWeight，同一用户同模型尽量稳定命中同一路由区间，无粘性则随机偏移命中。权重：weight<=0 视为 1；按累计权重区间命中。
   - apiKey 额度在 Redis ZSet 里，写入时机有两类：
@@ -433,6 +433,8 @@ flowchart TD
 **费用阈值检查执行逻辑（同一个 flowControl 内）：**
 - 先用 getConfigFee(system, model, time) 取当日费用阈值（同样 DB 优先，其次配置，最后 defaultFee）。
 - 再 computeModelFee(...)（或 computeModelFeeByTimes(...)）读取日累计 usage/fee 缓存，按模型单价换算当日费用。
+  - 主流模型走 computeModelFee(...)：按 token/金额累计来判断阈值。
+  - 少数模型（如 agent 模型）走 computeModelFeeByTimes(...)：按请求次数 * 单次单价来算。
 - 超过阈值抛 CHAT_GPT_FEE_OVER_LIMIT。
 - 在 80%/100% 阈值会触发告警消息（IM），100%会拦截。
 
@@ -467,18 +469,17 @@ flowchart TD
 
 **这条链路是“先 flowControl(时段+费用)，再 checkCutoff(断流)，再 externalCallLimit(次数)”，三道闸都过了才会真正进入模型调用。**
 
-##### （4）时间阈值维度 与 次数校验的关系
+##### （5）时间阈值维度 与 次数校验的关系
 
-两者都是“按次数”，但维度和目的不同：
 
-**时段阈值限流（flowControl）**
+**时段阈值限流（flowControl）（按 token 算+按次数算）**
 
 - 维度：system + model + 时段规则
 - 粒度：偏“系统级总量控制”
 - 规则：支持分时段阈值（如 08:00-12:00 不同于夜间）
 - 目的：防系统级流量冲击，保护整体容量与成本
 
-**外部接口次数限流**（OpenAiExternalCallLimitService）
+**外部接口次数限流（按次数算）**（OpenAiExternalCallLimitService）
 
 - 维度：date + system + user + model
 - 粒度：偏“用户级配额控制”
@@ -487,31 +488,191 @@ flowchart TD
 
 一句话：**前者管“这套系统在这个时段总共能打多少”，后者管“这个用户今天在这个模型上还能打多少”。两层叠加是“总量保护 + 个体约束”。**
 
+### Q3：鉴权+限流+调用流程串联
+
+2 个注意点：
+- 席位制也要走同一套前置校验（鉴权、黑名单、模型权限、时段阈值限流、费用阈值、checkCutoff、外部次数限流）。
+- 大部分限制都在上游调用前执行，但有一个重要例外：上游返回账号级 429 后，会回写资源冷却，然后入口层做一次重试（这是调用后触发的治理动作）。
+
+总流程图如下：
+```mermaid
+flowchart TD
+    A["请求进入 /external/openai/v1/chat/completions"] --> B["LoginNameInterceptor<br/>解析AIGC_USER并写入UserUtils"]
+    B --> C["@CheckAccessToken / @CheckSecretKey<br/>校验系统身份与签名时效"]
+    C --> D["黑名单校验 isUserBlack(user, appKey)"]
+    D --> E["Controller 解析 model/stream"]
+    E --> F["checkOpenAiMode(model)"]
+    F --> G["checkUtil.checkModel(model, system)"]
+    G --> G1["系统存在 + 模型白名单(fdModels)"]
+    G1 --> G2["flowControl / flowControlByTimes<br/>时段阈值 + 费用阈值"]
+    G2 --> G3["checkCutoff(systemDto)"]
+    G3 --> H["openAiExternalCallLimitService.checkAndIncrement<br/>system-user-model 次数限流(Redis+Lua)"]
+    H --> I["openAiService.standardMode"]
+
+    I --> J{"appKey+model 命中 poolCode ?"}
+    J -->|是| K["席位制: acquireChatGptConfig(poolCode,model,uid)<br/>绑定复用/亲和复用/容量抢占(Lua)"]
+    J -->|否| L["Token制: getChatGptConfig(model,maxTokens,userId)<br/>按 token 容量(>=maxTokens)筛选并负载"]
+
+    K --> M["调用上游模型"]
+    L --> M["调用上游模型"]
+
+    M --> N{"上游是否账号级429?"}
+    N -->|否| O["正常返回 + 落库/统计"]
+    N -->|是| P["冷却资源(capacity ZSet)"]
+    P --> Q["入口 executeWithPoolRetry 一次重试"]
+    Q --> O
+
+```
+
+“调用前限制 vs 调用后治理”的双泳道图：
+```mermaid
+flowchart LR
+    subgraph PRE["调用前限制（Pre-Call Controls）"]
+        A["请求进入 /external/openai/v1/chat/completions"]
+        B["登录用户识别<br/>LoginNameInterceptor(AIGC_USER)"]
+        C["系统鉴权<br/>AccessToken/SecretKey 校验"]
+        D["黑名单校验<br/>isUserBlack(user, appKey)"]
+        E["模型合法性校验<br/>checkOpenAiMode(model)"]
+        F["模型权限校验<br/>system + fdModels"]
+        G["时段阈值限流<br/>flowControl / flowControlByTimes"]
+        H["费用阈值检查<br/>token计费 or 次数计费"]
+        I["断流校验<br/>checkCutoff"]
+        J["外部调用次数限流<br/>system-user-model (Redis+Lua)"]
+        K{"资源分流"}
+        L["席位制调度<br/>poolCode 命中后绑定/复用/抢占"]
+        M["Token制调度<br/>按 maxTokens 选择可用apikey"]
+    end
+
+    subgraph POST["调用后治理（Post-Call Governance）"]
+        N["调用上游模型"]
+        O{"是否账号级429?"}
+        P["冷却资源<br/>capacity ZSet写负分/冷却到期"]
+        Q["入口一次重试<br/>executeWithPoolRetry"]
+        R["返回响应"]
+        S["调用结果落库<br/>主记录/内容/token/费用"]
+        T["指标与统计上报<br/>监控/报表/聚合"]
+    end
+
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K
+    K -->|席位制| L --> N
+    K -->|Token制| M --> N
+
+    N --> O
+    O -->|否| R
+    O -->|是| P --> Q --> R
+    R --> S --> T
+
+```
+
+### Q4：大模型请求与响应相关问题解析
+
+#### （1）同步 / 流式 / 异步 / 全双工 / 本地通信 等请求有什么区别？这个项目入口如何选择？
+
+参考下面的表：
+
+| 调用模式 | 适用大模型类型 | 典型应用场景 | 底层传输协议 |
+| :--- | :--- | :--- | :--- |
+| 同步调用<br>(非流式) | 文生图 / 视频生成<br>*(如 DALL-E, Stable Diffusion)* | 用户输入提示词，等待几秒到几分钟，最后一次性展示生成的图片或视频。因为中间过程无法“流式”展示（图片缺了一半没法看），所以适合等做完了再返回。 | HTTP / HTTPS<br>(标准请求-响应) |
+| 流式调用<br>(打字机效果) | 文本生成 (LLM)<br>代码生成<br>多模态理解<br>*(如 GPT-4o, Claude, Llama 3)* | 聊天对话、写文章、写代码。这类内容具有“线性”特征，用户可以边读边思考，因此必须用流式来降低感知延迟。 | SSE<br>(Server-Sent Events)<br>*(基于 HTTP)* |
+| 异步调用<br>(轮询/Webhook) | 超长任务模型<br>*(如长视频生成 Sora, 大规模数据分析)* | 生成一段 1 分钟的视频，或者分析几百兆的财报数据。这种任务耗时太久（几分钟甚至几小时），直接 HTTP 连接会超时，所以必须先拿任务 ID，稍后再去取结果。 | HTTP + 轮询/Webhook |
+| 全双工交互<br>(实时流) | 语音对话模型<br>实时翻译<br>*(如 Whisper, GPT-4o Realtime API)* | 像打电话一样跟 AI 聊天。需要一边把麦克风录音传上去（上行），一边把 AI 的声音听下来（下行），且要求极低延迟，不能有任何卡顿。 | WebSocket<br>(WSS) |
+| 本地/插件通信<br>(MCP) | 工具调用 / 智能体<br>*(Agent Frameworks)* | AI 需要读取你本地的文件、操作数据库或运行代码解释器。这通常发生在本地环境或内网中。 | stdio<br>(标准输入输出) |
+
+**项目里面如何区分不同的接口：**
+
+- **按接口路径分流（老接口）**：/external/sync/...、/external/stream/...（显式分开）
+- **按请求参数 stream 分流（OpenAI兼容）**：/external/openai/v1/chat/completions 同一路径，根据 body 的 stream 判断
+- **异步任务按业务接口分流**：
+    - chat-app 有部分异步入口（如 /aiDraw/async/{modelKey}/submitTask）
+    - multimedia 典型是 createTask + task/status + callback
+
+#### （2）调用外部模式，结果是透传给用户还是归一化处理后再返回给用户
+
+**透传：**
+- 请求体基本不改，响应也尽量原样返回（只做少量头/字段增强）。
+- 典型是 OpenAI兼容透传接口，见 `OpenAiExternalController.java + BaseOpenAiImpl.java`
+
+**归一化：**
+- 入口把不同请求DTO统一成内部DTO（`ContextCompletionDto/New/4V`）。
+- 出口把不同厂商响应映射成统一结构（包括模型名映射、tool_calls等兼容）。
+- 典型是 /external/standard/* ，见 `ChatStandardExternalController.java + ChatStandardUtil.java`
+
+**如何选择** ：走哪个接口就决定了策略：`/external/openai/*` 偏透传，`/external/standard/*` 偏归一化。
+
+#### （3）使用不同的协议的时候，应用如何在调用方和模型提供方之间调度
+
+可以把它理解成一句话：**调度核心一致，协议只是“传输形态”不同。**
+
+**统一调度骨架（四种协议都共用）**
+- 入口鉴权（appKey/secret、用户识别、黑名单）
+- 前置治理（模型权限、时段限流、费用阈值、cutoff）
+- 资源路由
+    - 命中 poolCode：走席位池（绑定复用/亲和/抢占）
+    - 未命中：走 Token 资源路由（按 model + maxTokens 选可用 key）
+- 选到 ChatGptConfig（url/apiKey/modelName）后，才真正调用上游
+- 调用后治理（429 冷却、一次重试、日志/计费/统计落库）
+
+##### （1）HTTP（同步）
+
+- 调用方体验：一个请求拿完整响应。
+- 调度方式：按上面统一骨架选好资源后，用 HTTP/SDK 发起同步调用（如 OkHttp 或 Bedrock SDK converse）。
+- 返回：完整 JSON 一次性返回；失败按错误码返回，池化 429 可触发一次重试。
+
+如：`POST /external/sync/contextCompletions`，入口在 `ChatGptExternalController.java (line 77)`，实际同步调用在 `ChatGptServiceImpl.java (line 115)`。
 
 
+##### （2）SSE（流式）
 
+- 调用方体验：持续收到增量 token/chunk。
+- 调度方式：前置治理与资源选择和同步完全一致；只是上游调用改为流式端点。
+- 返回：chat-app 边读上游边 flush 到下游；必要时做轻量归一化（比如模型名映射），最后落库统计。
+（不用修改代码，只需要在请求加一个 Accept: text/event-stream，这样响应就会变成 SSE 流式）
 
+如：`POST /external/stream/contextCompletions`，入口在 `ChatGptExternalController.java (line 262)`，流式转发在 `ChatGptServiceImpl.java (line 192)（aigcApi.streamChatGpt(...)）`。
 
+##### （3）WebSocket（双工）
 
+- 调用方体验：全双工实时交互（音频/实时会话）。
+- 调度方式：**chat-app 建立“下游客户端会话 ↔ 上游模型 WS 会话”的 NextHop 桥接**。上游 URL/API Key 仍由资源路由选出（同样可走配额/路由策略）。
+- 返回：双向帧透传；会话级生命周期管理（连接、转发、断开清理）。
 
+如：`WebSocket` 路由注册在 `ProxyWebSocketConfigurer.java (line 60)`（默认如 `openai/realtime`）。服务端处理在 `WebSocketProxyServerHandler.java (line 49)`，上游 WS 握手与转发在 `NextHop.java (line 57)`。
 
+##### （4）HTTP + Webhook（异步）
 
+- 调用方体验：先拿任务ID，后查状态或等回调。
+- 调度方式：提交阶段先做前置校验，再选资源/节点并创建上游异步任务；本地先落任务表（submitted/processing）。
+- 返回与闭环：
+    - create 立即返回 taskId/externalTaskId
+    - status 轮询上游或查本地状态
+    - callback(webhook) 回写任务状态、下载产物、更新费用/token、触发后续处理
 
+如：`POST /aiDraw/async/{modelKey}/submitTask`
+入口在 `AiDrawController.java (line 92)`。
 
+### Q5：chat-app 和 aigc-multimedia 对比解析
 
+#### （1）chat-app
+**chat-app（在线实时）：**
 
+- 主要是文本/多模态对话类（GPT、Claude、Qwen、Gemini、DeepSeek 等）和部分绘图/实时能力。
+- 更偏“低延迟在线请求-响应”，主要的协议是**同步 + 流式**，就是事实绘图生成视频，流式文本对话（SSE）。也有少量异步任务入口（比如部分绘图/任务提交接口）和 WebSocket 实时链路（语音处理）。
 
+**chat-app 的多模态对话主要包括：**
+- GPT-4V / GPT-4o 这类图文对话（contextCompletions4V、/external/standard/multiMode）
+- Qwen-VL（视觉理解）
+- 一些工具调用场景下的多模态统一入口（multiMode + tools）
+- 另外还有一部分“实时多模态/语音交互”是通过 websocketreverseproxy 做 WS 代理（如 Gemini realtime、Qwen Omni realtime、SAUC）
 
+#### （2）aigc-multimedia（异步任务）
 
+- 明确覆盖视频/语音等长任务模型：soraVideo/sora-2、doubao-seedance-*、kelingVideo、speechToText/textToSpeech 等。见 ModelConstant.java
+- 更偏“任务编排”：**提交任务、轮询状态、回调落库、下载/转存OSS、失败补偿。**
 
+#### （3）核心差异：
 
-
-
-
-
-
-
-
+**chat-app：请求即执行，重点是鉴权/限流/资源路由/实时返回。**
+**multimedia：任务状态机，重点是队列、锁、回调、结果持久化与重试。**
 
 
 
