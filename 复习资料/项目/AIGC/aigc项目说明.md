@@ -796,6 +796,266 @@ AigcApi 定义了统一入口，同时通过 default 方法覆盖不同协议能
 
 好处：**平台通过 AigcApi 把平台能力面和厂商实现面解耦，新增模型时优先复用抽象和保存链路，只在适配层补厂商差异。**
 
+### Q7：各种模型调用说明
+
+#### （1）千问
+
+当前系统（QwenExternalController）对外提供的接口
+见 QwenExternalController.java
+- POST /external/qwen/standard/v1/chat/completions
+- POST /external/qwen/standard/{mode}/v2/chat/completions（mode=stream|sync）
+
+**当前系统已落地的能力**
+
+- 同步/流式两种调用
+    - v1：通过 body 的 stream 决定
+    - v2：通过路径 stream/sync 决定
+
+- OpenAI 兼容 Chat 能力（v1）
+    - 对应上游 .../compatible-mode/v1/chat/completions
+
+- DashScope 原生能力（v2）
+    - 文本：/api/v1/services/aigc/text-generation/generation
+    - 多模态：/api/v1/services/aigc/multimodal-generation/generation，见 ChatGptQwenServiceImpl.java (line 63)
+
+- 流式 token 统计返回
+    - v1 流式时自动注入 stream_options.include_usage=true
+    - v2 流式时带 X-DashScope-SSE: enable
+
+- 多模态输入（图/视频）可走
+    - 是否可用取决于你传入模型（如 qwen3-vl-* / qwen3.6-plus）与请求体结构
+
+- 联网搜索参数透传
+    - v1 读 enable_search
+    - v2 读 parameters.enable_search
+
+**当前没在这个 Controller 暴露的能力**
+
+- 没有单独暴露 Embedding / Image Generation / Batch / File 等专用接口（这里只是 chat/completions 这条线）。
+- 这些能力即使百炼平台支持，当前系统也未在 QwenExternalController 直接开放独立路由。
+
+##### （1）什么是 openai 兼容
+
+兼容 OpenAI 的接口协议（主要是请求/响应结构），典型就是 POST /v1/chat/completions 这套格式：model/messages/stream/tools/usage...。
+
+常见 OpenAI 兼容接口族一般包括：
+- chat/completions（对话）
+- embeddings（向量）
+- images（文生图/图编辑，是否支持看供应商）
+- audio（TTS/STT，是否支持看供应商）
+- files（文件上传/管理）
+- batches（批量离线任务）
+- 部分平台还支持 responses/conversations 兼容
+
+##### （2）DashScope 原生能力是什么意思
+
+就是不走 OpenAI 兼容层，而是直接按阿里云百炼 DashScope 自己的原生协议调。原生接口通常参数命名、结构（如 input/parameters）和兼容层不完全一样，但能覆盖百炼的一些特色能力和细粒度参数。
+
+##### （3）Embedding / Image Generation / Batch / File 是什么
+
+这些是不同能力域，通常不在同一个 chat 路由里：
+
+- Embedding：把文本/图像转成向量，用于检索/RAG。
+- Image Generation：文生图/图编辑。
+- Batch：异步批量推理任务。
+- File：上传文件给长文档问答/批处理使用。
+
+#### （2）ChatGPT
+
+当前提供的接口（模型能力相关）
+
+**文本对话（同步）**
+- /external/sync/contextCompletions
+- /external/sync/contextCompletionsV2
+
+**多模态对话（图文，GPT-4V）**
+- /external/sync/contextCompletions4V
+- /external/stream/contextCompletions4V
+- /external/stream/webContextCompletions4V
+
+**文本对话（流式）**
+- /external/stream/contextCompletions
+- /external/stream/contextCompletionsV2
+- /external/stream/webContextCompletions
+- /external/stream/webContextCompletionsV2
+
+**千问VL（在这个 GPT 外部控制器里也有）**
+- /external/sync/completionsQwenVl
+- /external/stream/contextCompletionsQwenVl
+
+**配套接口（非推理）**
+- /external/getAccessToken（系统换 token）
+- /external/sys/getUserConfig
+- /external/promptTemplate/page
+
+**当前系统已实现的核心能力**
+- 同步 + 流式（SSE 输出流）双模式
+- 文本 + 图文多模态（4V / QwenVL）
+- 模型级鉴权与白名单校验（fdModels）
+- 限流/断流前置（checkCutoff + flowControl）
+- 场景透传（SCENE）、来源透传（platform-source）
+- 登录态与无登录态两类流式入口（@CheckAccessToken 的 type 不同）
+
+**实现里几个重要限制（你对接时要注意）**
+
+- 流式接口禁用 functions/tools（会直接报 NOT_SUPPORT_MODEL）
+- o1/o1-mini 禁止流式（会报 STREAM_NOT_SUPPORT）
+- 某些模型被标记为“ban mode”，要求改走“标准新接口”
+- 部分同步场景有 PTU 优先和回退逻辑（gpt-4o-ptu -> gpt-4o）
+
+
+##### （1）PTU 优先 + 回退逻辑 解析
+
+PTU 一般是 Provisioned Throughput Unit（**预置吞吐单元/预留吞吐能力**）。
+
+在你这套系统里，GPT_4O_PTU 可以理解成“**专用容量通道**”：
+- 先走 PTU：优先用预留资源，延迟和稳定性通常更好。
+- PTU 不可用或触发限制：回退到普通共享通道（如 GPT_4_O）。
+
+##### （2）为什么流式禁用 functions/tools
+
+- 当前流式链路是“文本增量分片”的实现，重点在 delta.content 的持续下发；对 tool/function call 这种结构化增量（参数拼接、调用编排、回填结果）并没有完整支持。
+- 另外你这套里也有上游能力约束（例如某些增量输出与 tools 组合本身就受限）。
+
+**所以入口直接拦截并报 NOT_SUPPORT_MODEL，是为了避免“半支持”导致协议不一致、前端状态机错乱。**
+
+#### （3）Claude
+
+这套 Claude 外部接口主要走的是 AWS Bedrock Converse/ConverseStream，不是直接调用 Anthropic POST /v1/messages。
+
+当前系统对外提供的 Claude 接口：
+- POST /external/claude/standard/sync/v1/chat/completions
+- POST /external/claude/standard/stream/v1/chat/completions
+- POST /external/claude/standard/sync/v2/chat/completions
+- POST /external/claude/standard/stream/v2/chat/completions
+- POST /external/claude/standard/sync/v3/chat/completions
+- POST /external/claude/standard/stream/v3/chat/completions
+- POST /external/claude/cache/reDeal（历史缓存重算运维接口）
+
+##### （1）当前系统 Claude 能力
+
+- **文本+图像多模态对话**：支持 text、image_url，图像可 URL 或 base64
+- **工具调用（function/tools）**：支持工具定义下发、tool_use / tool_result 往返，流式和同步都处理了 TOOL_USE 分支
+- **思考链/推理输出**（thinking/reasoning）：支持 thinking 参数透传（特定模型）和 reasoning_content/signature 处理
+- **流式返回**：stream 接口通过输出流持续写回分片（非一次性返回）
+- **Prompt Cache 计量解析**：解析 cacheReadInputTokenCount、cacheWriteInputTokenCount、cacheDetails.ttl
+- **V3 的区域路由与错误透传控制**：region 和 dealError 通过 query 参数控制
+
+在 ClaudeExternalController 这条链路里，没有单独暴露 Embedding / Batch / Files / Image Generation / Audio-Video 专用接口；**它是以“标准 chat（sync/stream）+ 多模态 + tool + thinking + cache统计”为主。**
+
+##### （2）Bedrock Converse/ConverseStream vs 直接调 Claude，有什么区别？
+
+**接入层不同**
+- 直接 Claude：对接 Anthropic 原生 API。
+- 现在这套：对接 AWS Bedrock 的 converse / converse-stream
+
+**鉴权与网络治理不同**
+- 直接 Claude：用 Anthropic key。
+- Bedrock：走 AWS 签名、AWS 账号与区域治理，更符合企业统一云管控。
+
+**协议与字段会有适配层**
+- 你平台做了一层标准化：对上游 Bedrock，对下游业务方保持统一接口风格。
+
+**企业能力更强：**
+- 区域路由、统一监控、限流、计费、审计、模型池路由、fallback 等，更容易在一个平台里统一做。
+
+**为什么要这样设置？**
+- 因为你们是“外部大模型管理平台”场景：重点不是“最短路径调用模型”，而是**统一治理、稳定性、合规、成本可控、可观测。**Bedrock 方案更符合这个目标。
+
+##### （3）Tool 到底怎么用？为什么请求里要定义 tool？
+
+完整闭环就是你说的那样：**声明工具 -> 模型判断 -> 返回 tool call -> 业务执行 -> 回传 tool result -> 模型生成最终答案。**
+
+**关键细节：**
+- tools 里通常不是“用户指定必须调用哪个工具”，而是“声明可用工具列表”。模型会自主判断要不要调用、调用哪个。
+- 工具真正执行一般在你业务侧（或 tool server），不是模型自己直接去执行本地函数。
+
+**“Tool 调用闭环”的时序图**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant Ctrl as ClaudeExternalController
+    participant Svc as ClaudeServiceImpl
+    participant Api as AigcApi(ChatGptClaudeTypeServiceImpl)
+    participant Up as Upstream LLM(Bedrock Claude)
+    participant Resp as HttpServletResponse(OutputStream)
+    participant Tool as Tool Executor(业务侧/调用方)
+    participant Save as Save/Log Service
+
+    C->>Ctrl: POST /external/claude/standard/stream/v3/chat/completions\n(messages + tools定义)
+    Ctrl->>Ctrl: 鉴权/模型校验/流控
+    Ctrl->>Svc: standardMode(dto, standardComm, response)
+    Svc->>Api: standardV3ChatGpt(dto, standardComm, response)
+    Api->>Resp: prepareResponseHeader(responseId)
+    Api->>Up: POST /converse-stream (透传tools/thinking等)
+
+    loop 上游持续返回分片
+        Up-->>Api: chunk(event/text/reasoning/tool_use)
+        Api->>Resp: write(chunk)
+        Api->>Resp: flush()
+    end
+
+    alt stop_reason == tool_use
+        Note over Api,Tool: 平台只透传/解析tool_use，不直接执行工具
+        Api-->>C: 返回tool_use(函数名+参数+toolUseId)
+        C->>Tool: 执行真实工具(如天气API/内部服务)
+        Tool-->>C: 返回tool_result
+        C->>Ctrl: 二次请求(messages + function_result/tool_result)
+        Ctrl->>Svc: standardMode(...)
+        Svc->>Api: standardV3ChatGpt(...)
+        Api->>Up: POST /converse-stream (携带tool_result)
+        loop 第二轮分片
+            Up-->>Api: final text chunks
+            Api->>Resp: write + flush
+        end
+        Up-->>Api: stop_reason=end_turn
+    else stop_reason != tool_use
+        Up-->>Api: 直接返回最终回答
+    end
+
+    Api->>Save: saveNewCommResponse(dto, standardComm, usage/responseId)
+    Svc-->>Ctrl: void
+    Ctrl-->>C: 流结束(同步场景则一次性返回完整体)
+
+```
+
+##### （4）“thinking 参数透传 + reasoning_content/signature 处理”是什么意思？
+
+- thinking 透传：你在请求里放 additionalModelRequestFields.thinking，系统会把它传给上游模型（特定模型生效）。
+
+- reasoning_content/signature 处理：模型返回推理片段时，代码会把推理文本/签名字段解析和拼装到响应对象里（主要在 Claude 类型实现中处理）。
+
+**简单说：前者是“请求控制模型推理行为”，后者是“响应里把推理内容结构化拿出来”。**
+
+##### （5）V3 的区域路由与错误透传控制，有什么价值？
+
+V3 支持 query 参数控制：
+- region：选择区域模型路由（见 ChatGptClaudeTypeServiceImpl.java (line 1574)）
+- dealError：是否把上游错误状态码+错误体尽量透传给调用方（见 ChatGptClaudeTypeServiceImpl.java (line 1706)）
+
+**相比 v1/v2，v3 的实用优化是：**
+- 区域可控（多区域弹性/合规/可用性更好）
+- 错误语义更透明（联调更快）
+- 流式处理更稳（字节流方式对上游分块更鲁棒）
+
+##### （6）Prompt Cache 计量解析
+
+**Prompt Cache 计量解析 是在解析这次请求里，有多少输入 token 走了缓存读/缓存写，用于计费和观测。**
+
+你代码里主要解析这些字段（Claude/Bedrock 返回的 usage）：
+
+- inputTokens：本次输入 token（常规）
+- outputTokens：本次输出 token
+- cacheReadInputTokenCount：本次从缓存命中的输入 token 数
+- cacheWriteInputTokenCount：本次写入缓存的输入 token 数
+- cacheDetails[].ttl、cacheDetails[].inputTokens：每段缓存的 TTL （**TTL 是 Time To Live（生存时间），就是“这份缓存能保留多久”。**）和写入 token 明细
+
+**它的具体作用：**
+- 精确计费：缓存读/写通常价格和普通输入不一样，必须单独统计。
+- 成本优化：你可以看命中率：cacheReadInputTokenCount 越高，说明复用越好、成本可能更低。
+- 运营排障：能看出是“没命中缓存”还是“缓存策略/TTL不合适”。
 
 
 
@@ -825,10 +1085,118 @@ AigcApi 定义了统一入口，同时通过 default 方法覆盖不同协议能
 
 
 
+### Q8 视频/音频/图片/多模态 等能力入口说明
 
+结论先说：视频/音频/图片/多模态都已有不少入口；但 Embedding 标准接口（/embeddings）在这个服务里没找到，batch/files 也不是 OpenAI 标准那套路由。
 
+#### （1）文本与多模态对话（外部）
 
+**Qwen:**
+- POST /external/qwen/standard/v1/chat/completions
+- POST /external/qwen/standard/{mode}/v2/chat/completions (stream|sync)
+见 QwenExternalController.java
 
+**OpenAI兼容总入口:**
+- POST /external/openai/v1/chat/completions
+见 OpenAiExternalController.java
+
+**通用标准入口（含 multiMode）:**
+- POST /external/standard/contextCompletions
+- POST /external/standard/multiMode
+- POST /external/openai/standard/v1/chat/completions
+见 ChatStandardExternalController.java
+
+#### （2）图片能力
+
+**AI 绘图/改图/图生图/描述图/异步任务：**
+- 基础前缀 /external/aiDraw/...
+- 见 AiDrawExternalController.java
+
+**图片分析（流式）：**
+- POST /external/analyzeImage/streamAnalyzeImage
+- 见 AnalyzeImageController.java
+
+**Gemini 生图：**
+- POST /external/gemini/standard/sync/v1/{model}/image
+- 见 GeminiExternalController.java
+
+#### （3）视频能力
+
+**Gemini Veo:**
+- POST /external/gemini/standard/v1/video/{model}/generate
+- POST /external/gemini/standard/v1/video/{model}/fetch
+
+**Sora:**
+- POST /external/sora/{aigcmodel}/createText2Video
+- GET /external/sora/{aigcmodel}/task
+- GET /external/sora/{aigcmodel}/checkStatus
+- 见 SoraExternalController.java
+
+**Volcengine 视频:**
+- POST /external/volcengine/{aigcmodel}/createVideo
+- GET /external/volcengine/{aigcmodel}/task
+- 见 VolcengineVideoController.java
+
+**KlingAI 多类视频任务:**
+- /external/klingai/{aigcmodel}/createText2Video、createPhoto2Video、createMultiPhoto2Video、createEffects2Video、createOmni2Video 等
+- 见 KlingAiExternalController.java
+
+#### （4）音频能力
+
+**火山音频：**
+- POST /external/volcengine/audio/standard/v1/{model}/upload
+- POST /external/volcengine/audio/standard/v1/{model}/status
+- POST /external/volcengine/audio/standard/v1/{model}/tts
+- 见 VolcengineAudioExternalController.java
+
+**讯飞实时转写：**
+- /external/iFlyRec/realTime/initTask|stopTask|queryTask|createOrUpdateHotWords|queryHotWords
+- 见 IFlyRecExternalController.java
+
+**通义听悟实时/离线：**
+- /external/realtimeTrans/submitTask|stop|getTaskInfo|submitOffLineTask
+- 见 TingWuExternalController.java
+
+**Speech 通用接口：**
+- POST /external/speech/{aigcmodel}/completions
+- GET /external/speech/{aigcmodel}/history
+- 见 SpeecExternalController.java
+
+#### （5）文件/翻译相关
+
+**文档翻译、上传、下载：**
+- /external/azure/translateDocument
+- /external/azure/uploadNewTranslateDocument
+- /external/{id}/downLoadDocument
+- 见 AiTranslateExternalController.java
+
+**内部上传接口（非 external）：**
+- POST /chatGpt/uploadFile
+- 见 ChatGptController.java (line 233)
+
+#### （6）WebSocket 实时通道
+
+**已配置 WS 代理入口（Gemini/Qwen Omni/SAUC 等）：**
+
+**默认路径来自配置：**
+- openai/realtime
+- external/gemini/live/official/standard/v1/chat/completions
+- external/doubao/sauc/realtime
+- external/qwen/omni/realtime
+- 见 ProxyWebSocketConfigurer.java
+
+#### （7）你关心的 Embedding / Batch / Files 结论
+
+在这个服务代码里没扫到标准 POST /embeddings 路由（只看到 tokenizer 里有 embedding 模型名映射，不是接口）。也没扫到 OpenAI 标准 files / batches 路由。
+
+说明这些能力如果有，大概率在别的服务（比如你们的 multimedia 或其他网关服务）里。
+
+### Q9：同步接口与流式接口返回的问题
+
+同步的接口都有一个返回值：ResponseVO<ChatGptResponse>，而流式接口返回值都是 void。原因：
+
+- 同步接口是“一次性返回完整结果”，所以走标准 MVC 返回值：ResponseVO<...>。
+- 流式接口虽然方法签名是 void，但它通过 HttpServletResponse 的输出流持续 write + flush 把分片数据推给客户端（SSE/chunked）。**所以流式“不是没返回”，而是“边算边写到连接里”，返回通道不在 Java 方法返回值，而在 HTTP 长连接本身。**
 
 
 
