@@ -1243,6 +1243,111 @@ flowchart TD
 
 **所以平台的角色是：** 协议适配器+函数调用信息的透传/解析器，而不是自动执行函数的运行时。
 
+#### （5）图片生成模型
+
+这个项目的生图能力，整体上是两条线：
+- 通用生图网关线（AiDraw）：通过 AiDrawExternalController 按模型名路由到不同实现。
+- 厂商专线（Gemini）：独立 controller/service，不走 AiDraw 接口。
+
+##### （1）按厂商维度梳理当前项目的实现:
+- OpenAI/Azure 系：DallE2Draw、DallE3Draw、GptImage1Draw
+- MidJourney 系：MidJourneyDraw
+- Stable Diffusion 系：SdDraw
+- 火山/豆包系：VolcengineVisualServiceImpl(doubaoDraw)、DoubaoSeedream4P0Draw/5P0LITE
+- Google Gemini 系：GeminiExternalController + GeminiServiceImpl + ChatGptGeminiServiceImpl
+
+##### （2）同步/异步是怎么处理的
+
+**同步直出型（一次请求拿最终图）：**
+- GptImage1Draw、DallE3Draw、Gemini syncStandardV1Image、DoubaoSeedream4P0(非任务轮询场景)
+- 典型处理：**请求上游 -> 拿结果 -> 上传 OSS（或替换 URL）-> 保存历史/图片 -> 返回**。
+
+这里上传 OSS 后再保存历史/图片到数据库，本质是做可追溯与可查询闭环
+- 图片文件本体在对象存储（OSS）里，数据库不存二进制。
+- 库里存两类记录：
+    - ai_draw_history：任务级信息（请求、模型、进度、token/expense 等）
+    - ai_draw_pic：图片级 URL（resultUrl 原始地址、ossUrl 平台地址）
+
+**异步任务型（先拿 taskId，后续查结果）**
+- MidJourneyDraw、DallE2Draw、SdDraw、VolcengineVisualServiceImpl（按 action 可 async）
+- 典型处理：**submit 返回 accepted + taskId -> history/getResult 轮询上游（提供接口） -> 成功后写 draw_pic 并更新进度。**
+
+异步查询接口成功拿到图后：
+- 将图片上传到 OSS，把图片 URL写入 ai_draw_pic
+- 把 ai_draw_history.progress 更新为完成（代码里常见 103）
+
+**所以“图片放哪里”**：放在 OSS；数据库只是索引/元数据。
+**“怎么查看图”**：调用 history 接口读库回放 choices[].delta 里的 URL。
+
+##### （3）计费方式
+
+**Draw 普通计费（按 feeType 策略，常见是按张/规格）**
+
+- 适用：多数传统生图链路（如 DallE3、MidJourney、部分豆包链路）。
+
+- 核心逻辑：
+    - 先按模型+时间窗口查计费规则 ChatgptModelFee。
+    - 走 feeType 对应的计费策略组件计算总价。
+    - 你可以理解成：总价 = 模型用量(modelDosage) × 对应单价（用量可能是**张数、规格档位**等）。
+
+**Draw Token 计费（按输入/输出 token 分段计价）**
+- 适用：Gemini/GPT-Image 这类会返回细粒度 token 的图片模型。
+
+- 核心逻辑：
+    - 读取 DrawHistory 里的 inputTokens/outputTokens/textTokens/imageTokens。
+    - 按 text/image 两套费率分别算，再求和。
+- 常规 token 生图（项目里的 buildDrawStatComponentWithToken）：
+
+- 输出费 = outputTokens / tokenUnit_text × completionPrice_text
+- 输入文本费 = textTokens / tokenUnit_text × promptPrice_text
+- 输入图片费 = imageTokens / tokenUnit_image × promptPrice_image
+- **总价 = 输出费 + 输入文本费 + 输入图片费**
+
+**Duration/时长计费（按时长或时长衍生用量）**
+- 适用：多媒体类更常见（视频/音频链路），你项目里也有统一能力。
+- 核心逻辑：
+    - 用 DurationStatDto（任务时长、分辨率、sourceType等）+ 计费规则计算。
+    - 不是简单“responseTime=计费时长”，而是根据业务字段走 feeType 策略。
+    - 你可口语化说：**总价 = 有效时长/单位时长 × 单价（可能叠加分辨率/来源档位）**。
+
+**图片计费是三路并存：按 feeType 的普通 Draw 计费、按 text/image token 的精细计费、按时长维度的多媒体计费，最终都统一上报到供应商计费服务。**
+
+如下：
+```mermaid
+flowchart TD
+    A["Client 发起生图请求"] --> B["生成结果并上传 OSS（或替换为 OSS URL）"]
+    B --> C["落库: ai_draw_history / ai_draw_pic"]
+    C --> D{"计费模式"}
+
+    D --> E["方式1: Draw 普通计费（feeType 策略）"]
+    D --> F["方式2: Draw Token 计费（text/image token）"]
+    D --> G["方式3: Duration 计费（时长/分辨率/来源）"]
+
+    E --> E1["读取 ChatgptModelFee（模型 + 时间窗 + modelLevel）"]
+    E1 --> E2["按 feeType 计算 modelDosage 与 totalFee"]
+    E2 --> E3["公式（口径）: totalFee = modelDosage × unitPrice"]
+
+    F --> F1["读取 DrawHistory: input/output/text/image tokens"]
+    F1 --> F2["读取 text/image 两套费率"]
+    F2 --> F3["常规口径: 输出费 + 输入文本费 + 输入图片费"]
+    F2 --> F4["Gemini 口径: 输入费 + 输出文本费 + 输出图片费"]
+    F3 --> F5["汇总 totalFee"]
+    F4 --> F5
+
+    G --> G1["读取 DurationStatDto（时长、分辨率、sourceType）"]
+    G1 --> G2["按 feeType/档位策略换算 modelDosage"]
+    G2 --> G3["公式（口径）: totalFee = durationDosage × unitPrice"]
+
+    E3 --> H["SupplierService 上报智数平台"]
+    F5 --> H
+    G3 --> H
+
+    H --> I["缓存/聚合告警（可选）"]
+    I --> J["返回查询结果（history/historyList）可追溯账单与图片"]
+
+```
+
+
 
 
 
