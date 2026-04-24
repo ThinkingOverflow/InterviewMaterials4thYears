@@ -1057,11 +1057,191 @@ V3 支持 query 参数控制：
 - 成本优化：你可以看命中率：cacheReadInputTokenCount 越高，说明复用越好、成本可能更低。
 - 运营排障：能看出是“没命中缓存”还是“缓存策略/TTL不合适”。
 
+#### （4）Gemini （含翻译、图片生成、视频生成）
+
+**当前系统对外接口：**
+- 聊天（旧版）
+    - POST /external/gemini/sync/contextCompletions
+    - POST /external/gemini/stream/contextCompletions
+- 标准 Chat（统一协议）
+    - POST /external/gemini/standard/sync/v1/chat/completions
+    - POST /external/gemini/standard/stream/v1/chat/completions
+    - POST /external/gemini/standard/stream/v2/chat/completions（流式改进版）
+- 翻译 （**比较简单，也是文生文的样式，只不过这是是给翻译专门使用的接口**）
+    - POST /external/gemini/translate
+- 视频生成（Veo）
+    - POST /external/gemini/standard/v1/video/{model}/generate
+    - POST /external/gemini/standard/v1/video/{model}/fetch
+- 图片生成
+    - POST /external/gemini/standard/sync/v1/{model}/image
+- Deep Research
+    - POST /external/gemini/standard/stream/v1/{model}/completions
+
+**当前系统已支持的 Gemini 能力：**
+- 同步 + 流式聊天
+- 多模态输入：文本 + 图片 + 视频（请求构造时支持 image_url、video_url）
+- Function Calling：可声明函数并解析 functionCall
+- Thinking/推理 token 统计：读取 thoughtsTokenCount
+- 缓存计量：读取 cachedContentTokenCount 并落到 usage
+- Google Search 相关标志透传/计费扩展
+- Deep Research 流式透传
+- Veo 视频任务：发起长任务 + 查询任务结果
+- 图片生成并回传 OSS 地址
+
+官方模型页显示 Gemini 家族支持矩阵（不同模型能力不同）：**函数调用、缓存、thinking、搜索接地、图像/视频生成、Live 等。**
+
+你当前系统已经覆盖的主干能力：**Chat(同步/流式) + Function Calling + Caching计量 + Thinking计量 + Image + Veo + Deep Research。**
+未见独立外部接口：**Embeddings、Batch、Live API(WebSocket 实时音频)、独立 File API 管理。**
+
+另外一个重要点：你这套 Gemini 调用并非纯 Developer API 直连，而是明显包含 Vertex AI / Discovery Engine 路径（OAuth token + aiplatform.googleapis.com / discoveryengine.googleapis.com），属于企业化接入形态。
+
+##### （1）Thinking / 推理 token 统计 是什么意思？
+
+意思是：Gemini 某些模型会返回一部分“思考/推理”相关的 token 计量，你们系统把它算进 usage 里，它不是单独一份“展示给用户的思维链内容”，**而是统计模型内部推理消耗了多少输出 token**。
+
+##### （2）缓存计量是什么意思
+
+Gemini 这里当前主要是 读缓存 token，**统计“这次请求有多少输入 token 是从缓存命中的”**，目前代码里没有像 Claude 那样拆出明显的 cache write 计量字段。
+
+所谓的“缓存命中”，指的是Gemini 上游模型侧的上下文缓存 / cached content 在复用之前已经处理过的输入内容。也就是说，你这次发给模型的 prompt 里，有一部分内容以前已经提交过并被缓存了，模型这次不需要从头重新处理这一段，所以这部分 token 会记到 cachedContentTokenCount。
+
+**这个过程可以理解成：**
+- 第一次请求
+    - 你把一大段上下文、文档、提示词发给 Gemini
+    - Gemini 侧可能把它缓存起来
+- 后续请求
+    - 你继续引用同一份 cached content
+    - 上游识别出这部分已缓存，不再重复完整计入普通 prompt token
+    - 返回 cachedContentTokenCount
+
+**所以这里的“缓存”是：** Gemini/Vertex 侧的 prompt context cache， 不是你们 Java 本地内存缓存，也不是 Redis 直接回答用户问题
+
+它的作用主要是：
+- 降低重复上下文处理成本
+- 降低延迟
+- 提高长上下文复用效率
+
+整体的流程如下：
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as 调用方
+    participant Platform as 外部大模型平台
+    participant Gemini as Gemini/Vertex AI
+    participant Cache as Gemini Cached Content
+
+    Note over Client,Cache: 第一次请求：创建或使用一段可缓存上下文
+
+    Client->>Platform: 请求1\n(messages + 大段上下文/文档)
+    Platform->>Gemini: 转发请求
+    Gemini->>Cache: 写入/关联 cachedContent
+    Gemini-->>Platform: 返回结果1 + cachedContent 标识
+    Platform-->>Client: 返回结果1
+
+    Note over Client,Cache: 第二次请求：复用 cachedContent
+
+    Client->>Platform: 请求2\n(新问题 + cachedContent 标识)
+    Platform->>Gemini: 转发请求2
+    Gemini->>Cache: 查找 cachedContent
+
+    alt 命中缓存
+        Cache-->>Gemini: 返回已缓存上下文
+        Note over Gemini: 不再重复处理这部分输入\nusage.cachedContentTokenCount > 0
+        Gemini-->>Platform: 返回结果2 + usageMetadata\npromptTokenCount / cachedContentTokenCount
+        Platform->>Platform: 解析 usage\nprompt_tokens = promptTokenCount - cachedContentTokenCount\ncacheReadInputTokens = cachedContentTokenCount
+        Platform-->>Client: 返回结果2
+    else 未命中缓存
+        Cache-->>Gemini: 未找到/已过期
+        Note over Gemini: 重新完整处理全部输入
+        Gemini-->>Platform: 返回结果2 + usageMetadata\ncachedContentTokenCount = 0
+        Platform-->>Client: 返回结果2
+    end
+
+```
+
+理解：
+- 第一次请求，把一大段文档、系统提示词、背景材料交给模型，这段内容被缓存成 cachedContent
+
+- 第二次请求，你不再让模型从头“消化”这大段背景，而是直接引用这份缓存，然后只处理新问题
+
+所以缓存命中的本质是： **复用旧输入上下文的处理成本
+不是复用旧回答结果本身** ，这也是为什么代码里统计的是cachedContentTokenCount（命中的输入 token），而不是“命中的输出 token”或“命中的回答条数”。
 
 
+##### （3）Google Search 相关标志透传 / 计费扩展 是什么意思？
 
+意思是：如果请求里启用了 Google Search 相关工具或搜索能力，系统会：
+- 把“开启了搜索”这个标志带到调用链路里
+- 在计费/埋点时按“搜索增强调用”单独记账或扩展统计
 
+本质上是：**搜索不是普通文本生成，要单独识别和统计成本/调用类型。**
 
+##### （4）Deep Research 流式透传 是什么意思？
+
+意思是：这个接口不是把上游结果重新封装成你们自定义 chunk 格式，而是把上游 Deep Research 的流式响应几乎原样转发给客户端。
+
+所以“流式透传”就是：上游怎么流出来，平台就怎么尽量原样流给下游。
+
+##### （5）Gemini Developer API vs Vertex AI / Discovery Engine，有什么区别？
+
+现在这套不是简单 api key -> Gemini API 的直连方式，而是更偏企业接入：
+
+**Developer API**
+- 更像产品原生 API，通常用 API Key
+- 接入更轻，适合直接开发和快速试验
+- 能力以 Gemini 官方 API 暴露为主
+
+**Vertex AI**
+- 是 Google Cloud 体系里的企业级接入方式
+- 你们代码里是 OAuth/JWT 换 token，再去调 aiplatform.googleapis.com
+- 更适合做统一鉴权、配额、企业网络、区域路由、项目隔离、成本治理
+
+**Discovery Engine**
+- 不是普通聊天主链路，更偏“检索增强 / research / enterprise search assistant”
+- 你们的 deepResearch 就是走它
+
+**所以一句话：**
+- Vertex AI：企业化托管 Gemini 模型调用
+- Discovery Engine：企业检索/研究型增强服务
+- Developer API：更轻量的原生直连方式
+
+Vertex AI 的调用流程，放到你们这套代码里看，其实是一个很标准的“服务账号鉴权 -> 换 access token -> 调 Vertex AI endpoint -> 解析响应”流程。
+
+```mermaid
+flowchart TD
+    A["调用方发起请求"] --> B["你们的平台组装 Gemini/Vertex 请求体"]
+    B --> C["使用 Service Account 生成 JWT"]
+    C --> D["向 Google OAuth2 token 接口换取 access_token"]
+    D --> E["携带 Bearer access_token 调 Vertex AI"]
+    E --> F{"调用类型"}
+    F -->|同步| G["POST :generateContent"]
+    F -->|流式| H["POST :streamGenerateContent"]
+    F -->|Deep Research| I["POST Discovery Engine :streamAssist"]
+    F -->|视频生成| J["POST :predictLongRunning"]
+    G --> K["Google 返回完整响应"]
+    H --> L["Google 持续返回流式分片"]
+    I --> M["Google 持续返回 research 流"]
+    J --> N["返回长任务 operationName"]
+    K --> O["平台解析 usage / candidates / functionCall"]
+    L --> O
+    M --> O
+    N --> O
+    O --> P["平台写回客户端并落库/计费"]
+
+```
+
+**我们在 Google Cloud 项目里配置好服务账号与权限（或由平台团队统一发放），然后你们用该服务账号换 access_token 去调 Vertex AI / Discovery Engine。这样就能落到你说的这些企业能力：区域控制、统一鉴权、配额和计费治理。**
+
+##### （6）Function calling 的流程
+
+流程：
+- 调用方在请求里声明可用函数
+- 平台把函数定义按 Gemini 协议发给模型
+- 模型判断是否需要调用函数，如果需要，模型返回 functionCall
+- 平台解析这个 functionCall，把函数名和参数回给调用方
+- 调用方自己执行函数，再把函数结果作为下一轮输入发给模型
+
+**所以平台的角色是：** 协议适配器+函数调用信息的透传/解析器，而不是自动执行函数的运行时。
 
 
 
