@@ -754,31 +754,8 @@ sequenceDiagram
 如：`POST /aiDraw/async/{modelKey}/submitTask`
 入口在 `AiDrawController.java (line 92)`。
 
-### Q5：chat-app 和 aigc-multimedia 对比解析
 
-#### （1）chat-app
-**chat-app（在线实时）：**
-
-- 主要是文本/多模态对话类（GPT、Claude、Qwen、Gemini、DeepSeek 等）和部分绘图/实时能力。
-- 更偏“低延迟在线请求-响应”，主要的协议是**同步 + 流式**，就是事实绘图生成视频，流式文本对话（SSE）。也有少量异步任务入口（比如部分绘图/任务提交接口）和 WebSocket 实时链路（语音处理）。
-
-**chat-app 的多模态对话主要包括：**
-- GPT-4V / GPT-4o 这类图文对话（contextCompletions4V、/external/standard/multiMode）
-- Qwen-VL（视觉理解）
-- 一些工具调用场景下的多模态统一入口（multiMode + tools）
-- 另外还有一部分“实时多模态/语音交互”是通过 websocketreverseproxy 做 WS 代理（如 Gemini realtime、Qwen Omni realtime、SAUC）
-
-#### （2）aigc-multimedia（异步任务）
-
-- 明确覆盖视频/语音等长任务模型：soraVideo/sora-2、doubao-seedance-*、kelingVideo、speechToText/textToSpeech 等。见 ModelConstant.java
-- 更偏“任务编排”：**提交任务、轮询状态、回调落库、下载/转存OSS、失败补偿。**
-
-#### （3）核心差异：
-
-**chat-app：请求即执行，重点是鉴权/限流/资源路由/实时返回。**
-**multimedia：任务状态机，重点是队列、锁、回调、结果持久化与重试。**
-
-### Q6：AigcApi 这里使用了什么设计模式，作用是什么？
+### Q5：AigcApi 这里使用了什么设计模式，作用是什么？
 
 核心是 **策略模式 + 模板方法 + 适配器思路**
 
@@ -796,7 +773,7 @@ AigcApi 定义了统一入口，同时通过 default 方法覆盖不同协议能
 
 好处：**平台通过 AigcApi 把平台能力面和厂商实现面解耦，新增模型时优先复用抽象和保存链路，只在适配层补厂商差异。**
 
-### Q7：各种模型调用说明
+### Q6：各种模型调用说明
 
 #### （1）千问
 
@@ -1347,30 +1324,61 @@ flowchart TD
 
 ```
 
+#### （6）视频生成模型
+
+我们项目视频生成是多厂商异步任务架构：Gemini Veo、Sora、Volcengine、Kling 都是先提交任务再查询结果。
+
+##### （1）异步视频生成通用流程
+
+**相关流程图如下：**
+
+```mermaid
+flowchart TD
+    A["客户端: createVideo/createText2Video"] --> B["网关Controller鉴权+模型校验"]
+    B --> C["上游厂商创建任务"]
+    C --> D["返回 taskId/externalTaskId"]
+
+    D --> E["客户端轮询 task/fetch/checkStatus"]
+    E --> F["先查缓存(命中直接返回)"]
+    F -->|未命中| G["调用上游查询任务状态"]
+    G --> H{"任务状态"}
+
+    H -->|提交中/处理中| I["返回进度给客户端"]
+    I --> E
+
+    H -->|失败| J["返回失败原因给客户端"]
+    H -->|成功| K["拿到 videoOssUrl/duration/sourceType/totalToken"]
+
+    K --> L["写缓存(短TTL)并返回结果"]
+    K --> M["触发费用上送 saveSupplyInfo"]
+
+    M --> N{"计费口径选择"}
+    N --> N1["Duration计费"]
+    N --> N2["Duration+档位(modelLevel)"]
+    N --> N3["TotalToken计费"]
+
+    N1 --> O["SupplierService上报智数平台"]
+    N2 --> O
+    N3 --> O
+
+    O --> P["回写上传状态 UPLOADED/FAILED"]
+
+```
+
+##### （2）计费方式
+
+**Duration 时长计费**：按视频生成持续时间以及模型类型计费，适用于 Sora/Veo 等按时长计费链路
+
+**Duration + 档位计费**：在 Duration 基础上，按 sourceType + resolution 选 modelLevel 再计费。sourceType 可以理解成“**视频生成来源/形态标签**”，比如 Veo 里区分有声/无声；resolution 就是**分辨率**（如 1080p、4k）。系统会用 模型名 + sourceType + resolution 去匹配一个计费档位 modelLevel，匹配到就按该 modelLevel 计费；匹配不到就回退到通用时长计费。**其实就是先按视频标签+分辨率匹配一个档位计费（还要算上生成时长），匹配失败直接使用通用时长计费。**
+
+**TotalToken 计费**：按使用的全部 token 数计费，适用于部分火山视频链路
+
+**Sora 价格表计费**：单价由 **分辨率 + 秒数区间** 决定，再乘视频时长秒数，算出最后的价格。
+
+**当前项目的视频计费核心是“按任务完成后结果计费”**：主路径以时长计费为基础，部分模型会进一步根据 sourceType + resolution 映射到 modelLevel 做差异化单价；少数厂商按返回的 token/固定规格走专门规则。整体上先拿到任务完成结果，再统一做费用计算、落库和回传，保证计费与任务状态解耦且可补偿。
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-### Q8 视频/音频/图片/多模态 等能力入口说明
+### Q7 视频/音频/图片/多模态 等能力入口说明
 
 结论先说：视频/音频/图片/多模态都已有不少入口；但 Embedding 标准接口（/embeddings）在这个服务里没找到，batch/files 也不是 OpenAI 标准那套路由。
 
@@ -1476,31 +1484,103 @@ flowchart TD
 
 说明这些能力如果有，大概率在别的服务（比如你们的 multimedia 或其他网关服务）里。
 
-### Q9：同步接口与流式接口返回的问题
+### Q8：同步接口与流式接口返回的问题
 
 同步的接口都有一个返回值：ResponseVO<ChatGptResponse>，而流式接口返回值都是 void。原因：
 
 - 同步接口是“一次性返回完整结果”，所以走标准 MVC 返回值：ResponseVO<...>。
 - 流式接口虽然方法签名是 void，但它通过 HttpServletResponse 的输出流持续 write + flush 把分片数据推给客户端（SSE/chunked）。**所以流式“不是没返回”，而是“边算边写到连接里”，返回通道不在 Java 方法返回值，而在 HTTP 长连接本身。**
 
+### Q9：chat-app 和 aigc-multimedia 
+
+#### （1）对比解析
+##### （1）chat-app
+**chat-app 处理的任务：**
+
+- 主要是文本/多模态对话类（GPT、Claude、Qwen、Gemini、DeepSeek 等）和部分绘图/实时能力。
+- 更偏“低延迟在线请求-响应”，主要的协议是**同步 + 流式**，就是实时绘图生成视频，流式文本对话（SSE）。也有少量异步任务入口（比如部分绘图/任务提交接口）和 WebSocket 实时链路（语音处理）。
+
+**chat-app 的多模态对话主要包括：**
+- GPT-4V / GPT-4o 这类图文对话（contextCompletions4V、/external/standard/multiMode）
+- Qwen-VL（视觉理解）
+- 一些工具调用场景下的多模态统一入口（multiMode + tools）
+- 另外还有一部分“实时多模态/语音交互”是通过 websocketreverseproxy 做 WS 代理（如 Gemini realtime、Qwen Omni realtime、SAUC）
+
+**chat-app 的核心链路：**
+
+收到请求后做 access token 校验、模型权限检查、参数标准化，然后按模型能力走同步或流式。流式场景通常是上游分片返回，我们边读边写边 flush 给前端；异步视频类接口则更多是转发到下游中台并提供统一查询入口，同时做短期缓存和费用上报触发。
 
 
+##### （2）aigc-multimedia（异步任务）
 
+**处理的任务：**
 
+- 视频生成任务：Sora / Gemini Veo / Kling / Volcengine（创建、查任务、回调、定时补偿、计费回传）。
+- 语音相关：实时转写、语音识别/合成、回调、热词。
+- 更偏“任务编排”：**提交任务、轮询状态、回调落库、下载/转存OSS、失败补偿。**
 
+**异步任务的流程：**
 
+提交任务 -> 落库（SUBMITTED）-> 抢占并发槽位后发起上游任务 -> 更新为 PROCESSING + 记录 taskId -> 回调或轮询拿结果 -> 下载媒体并上传 OSS -> 更新结果与状态为 SUCCESS/FAILED -> 费用上传状态从 PENDING 变更为 UPLOADED/CANCELED。
 
+它同时有定时补偿能力：对处理中或长时间未闭环任务做二次检查，避免任务丢失或计费漏传。
 
+##### （3）核心差异
 
+**chat-app：请求即执行，重点是鉴权/限流/资源路由/实时返回。**
+**multimedia：任务状态机，重点是队列、锁、回调、结果持久化与重试。**
 
+##### （4）介绍说辞
 
+我们的 AI 网关整体分两层。
+- 第一层是 chat-app，我主要负责这块，它面向业务方提供统一 API，做鉴权、模型路由、流量控制、计费上传、实时与流式响应处理，核心场景是文生文、图生文、实时生图等低延迟交互。
+- 第二层是 aigc-multimedia，它更像异步任务中台，承接视频/图片异步生成、实时语音转写等长任务，负责任务状态机、回调/轮询、文件落 OSS、计费上传和失败补偿。两层拆分后，实时链路更轻，异步链路更稳，职责也更清晰。
 
+#### （2）异步任务一些问题分析处理
 
+##### （1）抢占并发槽位后发起上游任务，为什么这样操作？
 
+就是“先拿执行名额，再真正调用厂商 API”，逻辑：
+- 任务先落库为 SUBMITTED。
+- 通过 `updateVideoStatus(..., maxProcessNum, SUBMITTED -> PROCESSING)` 这种方式，只有抢到名额的任务才能从 SUBMITTED 变成 PROCESSING，然后才会调用上游创建任务。
+- 没抢到名额的任务继续排队，不会直接打上游。
+- 后续在下面几个时机触发调度抢占
+  - 新任务提交后会触发一次调度
+  - 某个任务完成后会再触发一次调度（腾出槽位后拉下一个）
+  - 定时/清理逻辑会触发补偿调度（防卡死、防漏处理）
 
+**作用：**
+- 防止瞬时高并发把上游打崩/限流。
+- 控制系统资源（线程、连接、回调处理压力）。
+- 保证队列有序推进（先提交先处理）。
 
+总结：**并发槽位就是异步任务的流控阀门，先抢槽位再发任务，避免上游雪崩。**
 
+##### （2）对处理中或长时间未闭环任务做二次检查，怎么做的？
 
+核心是“**定时补偿 + 状态门控 + 回传确认**”。
+
+**典型做法是：**
+
+- 定时扫描一段时间窗口内的数据（不是扫全表），只扫 chargeUploadStatus = PENDING 的任务。
+- 对 PROCESSING 的任务再去查一次上游状态：
+    - 还在跑：保持原样，下次继续。
+    - 已成功：补下载、补上传 OSS、补落库、补计费上传。
+    - 已失败：标失败并取消上传状态。
+- 对已成功但未上传计费的任务，补做费用上报。
+- 上报完成后通过 chargeUploadCallBack 把状态改成 UPLOADED；失败则 FAILED/CANCELED，避免重复上传。
+
+**所以它解决的是两类问题：**
+- 任务层面：回调丢了、查询中断、状态卡住导致“任务丢失”。
+- 计费层面：业务成功了但费用没上报导致“漏计费”。
+
+##### （3）如何避免重复计费或漏计费
+
+用 chargeUploadStatus 做幂等门控，只允许 PENDING 进入计费上传，回传成功再改 UPLOADED，失败改 CANCELED/FAILED，避免重复入账。
+
+##### （4）如何避免任务卡死（一直 processing）
+
+有超时清理和定时补偿机制，超过窗口会重查上游状态并兜底置失败或补齐结果
 
 
 
