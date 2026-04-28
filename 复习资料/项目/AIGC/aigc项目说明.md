@@ -1378,7 +1378,7 @@ flowchart TD
 **当前项目的视频计费核心是“按任务完成后结果计费”**：主路径以时长计费为基础，部分模型会进一步根据 sourceType + resolution 映射到 modelLevel 做差异化单价；少数厂商按返回的 token/固定规格走专门规则。整体上先拿到任务完成结果，再统一做费用计算、落库和回传，保证计费与任务状态解耦且可补偿。
 
 
-### Q7 视频/音频/图片/多模态 等能力入口说明
+### Q7： 视频/音频/图片/多模态 等能力入口说明
 
 结论先说：视频/音频/图片/多模态都已有不少入口；但 Embedding 标准接口（/embeddings）在这个服务里没找到，batch/files 也不是 OpenAI 标准那套路由。
 
@@ -1582,64 +1582,206 @@ flowchart TD
 
 有超时清理和定时补偿机制，超过窗口会重查上游状态并兜底置失败或补齐结果
 
+### Q10：项目支持的 6 种外部调用形态
 
+#### 1. 同步 HTTP
 
+适用场景：
+- 一次请求，一次完整响应
+- 兼容文生文，文生图，文生视频等多模态一次性推理，一次性响应非流式
 
+存在原因：
+- 兼容最传统的 API 调用方式
+- 适合对接业务后端、批处理调用、函数式调用场景
 
+#### 2. 流式 HTTP
 
+适用场景：
+- 大模型边生成边返回，前端逐字输出
+- 对延迟敏感但又不需要双向长连接
 
+存在原因：
+- 比同步 HTTP 体验更好
+- 兼容 SSE/流式响应的前端和服务端
 
+#### 3. 标准兼容 HTTP
 
+适用场景：
+- 业务方希望按 OpenAI/Claude/Gemini 标准协议接入
+- 平台内部统一做模型路由和厂商适配
 
+存在原因：
+- 降低业务接入成本，让业务方按标准协议调用，但平台内部可替换真实厂商和资源
 
+典型接口：
+- `/external/openai/standard/v1/chat/completions`
+- `/external/claude/standard/...`
+- `/external/gemini/standard/...`
 
+#### 4. WebSocket 实时会话
 
+适用场景：
+- 实时语音翻译等持续双向会话，上游主动推送事件流
 
+存在原因：
+- HTTP 不适合持续双向通信，需要建立“业务端 <-> 平台 <-> 上游模型”双链路，需要在事件流关键节点补 usage 和主记录
 
+典型接口：
+- `openai/realtime`
+- `external/gemini/live/official/standard/v1/chat/completions`
 
+#### 5. 异步任务接口
 
+适用场景：
+- 生成长视频大图片
+- 文档翻译
+- 长音频转写
+- 长耗时异步媒体任务
 
+存在原因：
+- 上游本身是任务制，不会立即给出结果
+- 任务耗时长，不能阻塞同步请求
 
+典型接口：
+- Sora 视频：`createText2Video` + `task/checkStatus`
+- Gemini Veo 视频：`generate` + `fetch`
+- 火山视频：`createVideo` + `task`
+- 翻译文档：提交任务后按 `taskId` 查状态
+- 语音转写/会议：`initTask/queryTask/getTaskInfo/history`
 
+#### 6. XXL-JOB 后台补偿/收敛链
 
+适用场景：
+- 补偿外部任务状态
+- 上传费用
+- 修正卡住任务
+- 完成态收敛
 
+存在原因：
+- 业务方不一定持续轮询
+- 平台自己也必须确保账务和状态一致
 
 
+典型 Job：
 
+1. `translateStatusJob`
+2. `soraVideoTaskJob`
+3. `veoVideoTaskJob`
+4. `volcengineJob`
+5. `iFlyTekTaskJob`
+6. `tingWuTaskJob`
 
+### Q11：项目各种模型的计费口径
 
+平台不是用统一一把尺子去量所有模型，而是根据模型能力本身选择最合理的计量口径，再统一折算进费用治理和账务体系。
 
+**文本/标准对话类**：主口径是 token。
 
+**计费链路：**
+文本模型主链 = 调用结束 -> 保存 ChatGptMain（各类 token 使用数等） -> 累计 token -> 折算 fee -> 上报智数平台
 
+**图片生成类**：主口径是图片张数、档位、尺寸，还有一些按 token 计费的情况
 
+**翻译类**：主口径是 characters，即按处理的字符数来计费
 
+**音视频 / 语音转写 / 视频生成**：主口径是 duration（时长），费用通常和**时长、档位、来源类型**强相关。部分视频按 token 或者次数计费。
 
+### Q12：如果让你概括这个项目最复杂的地方是什么（这个项目难点）
 
+最复杂的不是接厂商 SDK，而是把不同厂商、不同协议、不同产品形态和不同计费口径统一收敛起来。项目里既有同步 HTTP、流式 HTTP、WebSocket、异步任务，也有 token、duration、图片张数、characters、frequency、actionUsage 等不同统计口径。平台要在不暴露这些复杂性的前提下，对外提供统一接口，对内又能完成资源路由、状态收敛、费用治理和共享平台上报。
 
+### Q13：数据统计（含计费）流程详解
 
+#### （1）计费整体流程
 
+平台会对请求过程返回的数据进行详细的记录，统一统计分两层：
+- 请求级明细统计（实时）
+- 日/月聚合统计（账单视角）
 
+请求级 + 聚合链路图如下：
 
+```mermaid
+flowchart TD
+A[业务请求进入 chat-app] --> B[调用上游模型 同步或流式]
+B --> C[写本地业务明细 chatgpt_main/内容表/扩展表]
+C --> D[触发 SupplierService.saveCollect* 异步]
+D --> E[查价格 chatgpt_model_fee 按模型/日期/等级]
+E --> F[计费组件计算 QaTokenStat]
+F --> G[POST SaveCollectInfoReq 到智数平台]
+G -->|成功| H[写Redis日累计费用 键:系统+模型+日期]
+G -->|失败| I[异常补偿记录 SmartDataExceptionPush]
+H --> J[预算阈值检查 告警邮件]
 
+K[每日定时 CostAggregationDailyJob] --> L[聚合 main/extend/draw]
+L --> M[落库 chatgpt_daily_cost_aggregation]
+L --> N[落库聚合过程日志]
+O[每月定时 CostAggregationMonthlyJob] --> P[月聚合/账单邮件]
+M --> P
 
+```
 
+#### （2）请求级明细（实时）
 
+触发点：一次模型调用完成（同步返回，或流式结束）后。会先落业务明细到 chatgpt_main 库，并查价格明细计算费用，然后将费用上传到智数平台。
 
+##### （1）本地落库保存的信息
 
+- chatgpt_main：核心调用明细
+    - 用户：fd_user_id
+    - 系统：system_sign
+    - 模型：fd_model
+    - 场景：scene
+    - token：prompt_tokens/completion_tokens/total_tokens
+    - 成本快照：total_cost
+    - 缓存token：cache_read_tokens/cache_write_tokens
 
+- 相关业务表（按场景）
+    - 文本内容/会话内容表（如 chat content）
+    - 画图/视频/扩展用量表（draw、extend等）
 
+##### （2）查询价格明细并计算请求费用
 
+计费的大致的流程如下
+- **识别计费场景**：token / duration / frequency / characters / drawings / composite
+- **选价格**：根据模型类型和日期选择费用详情：chatgpt_model_fee
+- **选择计费组件**：根据计算场景，选择一个计费的组件，这些组件包含这种场景的计费逻辑，将价格信息传入进行费用计算。组件输出 QaTokenStat：
+    - 用量（ask/answer或时长等）
+    - 单价
+    - 分项费用与总费用
+    - 币种、feeType、modelDosage、orderTime
+- 上传智数 + 本地治理缓存累计 + 阈值告警
 
+**常见的计算组件：**
+- TokenFeeComponent
+- DurationFeeComponent
+- FrequencyFeeComponent
+- CharactersNumFeeComponent
+- DrawingsNumFeeComponent
+- CompositeFeeComponent（组合计费）
 
+通过 ChatGptFeeCompositeFactory 统一编排，最常用的是 TokenFeeComponent，原因是 chat-app 主流是文本/多模态对话，请求量最大，token口径最通用；其他组件主要在语音时长、翻译字符、绘图次数等场景占主导。
 
+**上传到智数平台什么**
 
+会将下面的信息上传到智数平台，包括：
+- ask/answer token与费用
+- totalFee
+- realRequestAppId/requestMip/remark(scene)
+- 扩展：fdModel/modelType/feeType/modelDosage/orderTime
 
+**上传到智数平台的作用**：
 
+**缓存里保存什么：**
 
+每次调用费用上报智数成功后，chat-app 会把这笔费用同时累加到 Redis 的日维度键（**系统 + 模型 + 日期**）里，形成实时费用水位。随后读取该系统该模型的日预算阈值，判断当前累计费用是否跨过告警档位（如 80%、100%）。如果触发且当天该档位还没发过，就通过分布式锁控制只发一次告警邮件，避免重复轰炸。
 
+##### （3）一段话描述
 
+- 请求完成后先查找模型价格，然后按**模型、计费类型和生效价格规则**计算本次费用；
 
+- 随后把调用明细（用户、系统、模型、token/时长、费用等）落到 chatgpt_main 等业务表，保证本地可追溯；
 
+- 最后再将标准化统计数据上报到智数平台，支撑跨系统的统一统计、成本分析和后续的数据挖掘与治理。
 
 
 
@@ -1689,3 +1831,46 @@ flowchart TD
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### （3）
