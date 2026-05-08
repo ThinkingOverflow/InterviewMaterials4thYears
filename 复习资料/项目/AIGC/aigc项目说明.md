@@ -1690,7 +1690,7 @@ flowchart TD
 
 最复杂的不是接厂商 SDK，而是把不同厂商、不同协议、不同产品形态和不同计费口径统一收敛起来。项目里既有同步 HTTP、流式 HTTP、WebSocket、异步任务，也有 token、duration、图片张数、characters、frequency、actionUsage 等不同统计口径。平台要在不暴露这些复杂性的前提下，对外提供统一接口，对内又能完成资源路由、状态收敛、费用治理和共享平台上报。
 
-### Q13：数据统计（含计费）流程详解
+### Q13：`chat-app` 数据统计（含计费）流程详解
 
 #### （1）计费整体流程
 
@@ -1720,6 +1720,16 @@ M --> P
 
 ```
 
+`chat-app` 的核心模式是：
+
+1. 请求调用上游模型
+2. 解析 usage / token / 图片 /缓存 / 搜索等信息
+3. 保存业务明细
+4. 在请求完成后异步触发计费上报
+5. 再通过日/月任务做聚合
+
+
+
 #### （2）请求级明细（实时）
 
 触发点：一次模型调用完成（同步返回，或流式结束）后。会先落业务明细到 chatgpt_main 库，并查价格明细计算费用，然后将费用上传到智数平台。
@@ -1743,7 +1753,7 @@ M --> P
 
 计费的大致的流程如下
 - **识别计费场景**：token / duration / frequency / characters / drawings / composite
-- **选价格**：根据模型类型和日期选择费用详情：chatgpt_model_fee
+- **选价格**：查询：chatgpt_model_fee 表，根据 fdModelKey + modelType + 生效时间 查找价格规则，某些模型再根据 modelLevel 找到更细粒度价格
 - **选择计费组件**：根据计算场景，选择一个计费的组件，这些组件包含这种场景的计费逻辑，将价格信息传入进行费用计算。组件输出 QaTokenStat：
     - 用量（ask/answer或时长等）
     - 单价
@@ -1761,6 +1771,31 @@ M --> P
 
 通过 ChatGptFeeCompositeFactory 统一编排，最常用的是 TokenFeeComponent，原因是 chat-app 主流是文本/多模态对话，请求量最大，token口径最通用；其他组件主要在语音时长、翻译字符、绘图次数等场景占主导。
 
+多口径计费详细如下：
+
+| 口径 | 典型场景 | 当前实现 |
+|---|---|---|
+| `token` | 文本、多模态问答 | `TokenFeeComponent` |
+| `duration` | 视频、语音、转写 | `DurationFeeComponent` |
+| `characters` | 文档/文本翻译 | `CharactersNumFeeComponent` |
+| `frequency` | 某些实时转写或动作计次 | `FrequencyFeeComponent` |
+| `draw/image` | 生图、图像类 | `DrawingsNumFeeComponent` / draw 特殊分支 |
+| `actionUsage` | 搜索/插件/工具增强 | `saveCollectInfoWithActionUsage*` |
+| `totalToken` | 异步视频但按 token 计费 | `saveCollectInfoWithTotalToken` |
+
+各种模态模型计费的典型特征：
+1. 文本模型：
+   - 分 input / output
+   - 可叠加 cache read / cache write / audio token
+2. 时长模型：
+   - 将毫秒换算成秒，再乘单价
+   - 某些模型又被覆盖成“业务计算后直接写入的扩展费用”
+3. 图片模型：
+   - 按张数、规格、token 混合计费
+4. 搜索/工具型：
+   - 通过 `actionUsage` 或 `modelLevel` 表达
+
+
 **上传到智数平台什么**
 
 会将下面的信息上传到智数平台，包括：
@@ -1770,6 +1805,8 @@ M --> P
 - 扩展：fdModel/modelType/feeType/modelDosage/orderTime
 
 **上传到智数平台的作用**：
+其实就是金融部门自己有一个面板，需要展示实时的 面板数据，如下图。因此我们异步计算完费用之后，需要及时将数据上传到智数平台。
+![alt text](/复习资料/项目/AIGC/img/image-3.png)
 
 **缓存里保存什么：**
 
@@ -1873,4 +1910,401 @@ M --> P
 
 
 
-#### （3）
+#### （3）日/月聚合统计
+
+**日聚合任务：CostAggregationDailyJob**
+
+- 扫描并聚合：
+  - chatgpt_main（文生文等），请求明细
+  - chatgpt_main_extend（插件/扩展用量），扩展计费明细
+  - 绘图/媒体相关费用明细
+- 聚合维度：通常是**系统 + 模型 + 模型类型 + 日期**（唯一键），聚合的内容：
+  - 调用量（可按来源表统计）
+  - 总token/总用量（按计费类型）
+  - 总费用（按系统/模型/日期）
+  - 可包含模型类型、币种、统计日期等维度字段
+- 结果落库：chatgpt_daily_cost_aggregation，过程日志落库：chatgpt_daily_agg_process_log（批次/状态），产出结果：
+    - 日级汇总表（对账主口径，支持回溯）
+    - 月级汇总与邮件报表（管理层看板/结算参考）
+    - 预算治理辅助（和实时Redis累计形成“实时+离线”双视角）
+
+**月聚合任务：CostAggregationMonthlyJob**
+  - 基于日聚合结果汇总月度统计，供月账单/邮件（CostAggregationMonthMailJob）使用。
+
+#### （4）需要注意的细节
+
+##### （1）token 计算细节
+
+在这个项目里面，token 计费分三层：
+
+- 第一层是基础 token，即 prompt_tokens（输入）和 completion_tokens（输出），总量为 total_tokens，这是最核心计费口径；
+  
+- 第二层是细分 token，用于解释成本构成，常见有 text_tokens（文本分词消耗）、reasoning_tokens（模型推理消耗）、image_tokens（多模态图片折算消耗）等，通常由上游 usage 明细返回并汇总到输入/输出；
+  
+- 第三层是缓存 token，包括 cache_write_tokens（把可复用上下文前缀写入缓存的消耗）和 cache_read_tokens（命中缓存并复用前缀的消耗），其是否并入输入计费或独立按读写单价计费由模型费率规则决定。
+- 整体作用是：**基础 token 决定主费用，细分 token 提供可解释性，缓存 token 用于降重复计算、控成本和降时延。**
+
+这里“上下文”通常就是发给模型的输入上下文片段，主要包括：
+- system prompt（系统指令）
+- 历史对话消息（user/assistant 多轮）
+- 可能的工具说明、长模板、固定业务前缀
+- 多模态场景下的可缓存输入片段（按模型能力）
+
+不只是“用户这一次的问题”，而是“这次请求里可复用的整段前文”。**所谓的请求上下文缓存，其实就是把之前回答相关的历史存储起来，协助模型理解相关问题，这样提问的时候就可以节省提问和回答的 token。**
+
+读写缓存分别指的是：
+- **写缓存（cache_write）**：把这段可复用前文在模型侧缓存起来，供后续请求复用。
+- **读缓存（cache_read）**：后续请求命中后，不再重复完整处理这段前文，而是引用缓存内容。
+
+
+**token 计费分三层：**
+- 第一层是基础 token，即 prompt_tokens（输入）和 completion_tokens（输出），总量为 total_tokens，这是最核心计费口径；
+- 第二层是细分 token，用于解释成本构成，常见有 text_tokens（文本分词消耗）、reasoning_tokens（模型推理消耗）、image_tokens（多模态图片折算消耗）等，通常由上游 usage 明细返回并汇总到输入/输出；
+- 第三层是缓存 token，包括 cache_write_tokens（把可复用上下文前缀写入缓存的消耗）和 cache_read_tokens（命中缓存并复用前缀的消耗），其是否并入输入计费或独立按读写单价计费由模型费率规则决定。
+**整体作用是：基础 token 决定主费用，细分 token 提供可解释性，缓存 token 用于降重复计算、控成本和降时延。**
+
+##### （2）计费方案总览
+
+当前系统并不是一个“统一计费中心”，而是一个“**多入口、多链路、分散计量、分阶段汇总**”的方案。
+
+它的特点是：
+
+1. `chat-app` 负责实时调用链路的记录、计量、费用上报和部分日/月聚合
+2. `aigc-multimedia` 负责异步图片/视频/音频任务的任务态收敛、结果补齐和费用上传准备
+3. `mip-chat-admin` 负责账单主表、部门归因、日账单、月账单、欠费提醒
+4. “费用计算”和“账单归因”并不在一个统一域内闭环，而是分布在：
+   - 实时请求结束点
+   - 异步任务完成点
+   - 聚合任务
+   - 管理后台账单任务
+
+换句话说：
+
+当前方案本质上是“业务系统先算一部分 + 后台任务再补一部分 + 管理后台再归因一部分”。
+
+即：**调用完成后先落调用明细并计算单次费用，上报共享计费平台；再由日/月聚合任务和 admin 归因任务做组织映射、账单汇总和扣费明细生成。**
+
+##### （3）详细的计费时机
+
+当前 `chat-app` 的费用计算时机是“请求完成后”。
+
+更准确地说：
+
+1. 同步接口：
+   在完整响应返回后，保存 `chatgpt_main`，随后异步调用 `SupplierService`
+2. 流式接口：
+   在流式响应消费结束、拿到最终 usage 后，再保存主记录并异步计费
+3. 图片接口：
+   在图片结果生成并落 `draw_history / draw_pic` 后计费
+4. 视频/音频等特殊链路：
+   在能拿到最终计费所需字段时再触发时长或 totalToken 计费
+
+这意味着：
+
+当前方案更像“后置结算”，而不是“请求进入就形成统一的计量事件”。
+
+##### （4）modelLevel 的含义
+
+在计费的时候，会根据 **模型类型 + 生效时间** 查找价格规则，某些模型再根据 modelLevel 找到更细粒度价格。
+
+这里modelLevel 本质是计费等级编码，不是模型名。它把同一个模型再细分成可计费档位。（定义在：ChatGptModelFeeLevelEnum.java）
+
+如下案例：
+- qwen3_coder_plus_0_32k / 32k_128k / 128k_256k...：按输入输出上下文大小分级计费
+- veo-3.0-generate-preview_voiceless / voiced：视频模式档（是否带音频）
+
+##### （5）详细分析admin 和 chat-app 里面的聚合任务和归因任务
+
+**chat-app 负责“先算”（日/月聚合 + 异步任务费用回填）**
+
+chat-app 聚合任务：
+- dailyCostAggregationJob：按天聚合文生文/扩展usage/绘图费用（主聚合入口）
+- dailyCostAudioAggregationJob：按天聚合音视频/实时转写类费用（从 multimedia 拉数据后聚合）
+- monthlyCostAggJob：把日聚合汇总成月聚合
+
+归因/对账辅助任务：
+- monthlyCostAggMailJob：读取月聚合结果，按系统生成月报并发邮件（不是重新算费用）
+
+异步费用回填任务：
+- soraVideoTaskJob：拉取 Sora 完成任务，算时长费并回填
+- tingWuAutoCompletedFeeTaskJob：通义听悟任务完成后补齐时长/扩展费用
+
+**admin 负责“归因落账”（用户/组织映射、日账单明细、系统与组织消耗更新）**
+
+归因主链路任务（最关键）：
+- ChargingMainSyncHandler：把调用主记录同步到 charging_main，并做“用户 -> 组织部门”映射归因
+- ChargingDaySyncHandler：由主记录汇总日维度 charging_day（可重跑）
+- DailyBillHandler：生成系统/组织日账单明细，更新消耗金额，触发月账单发送
+
+归因修复/补偿任务：
+- charingMainDataClean：历史主数据清洗与重算（含 token纠偏、cache/audio 等费用重算、部门回写）
+- charingDayDataCleanHandler：按日期重刷 day 聚合，修复漏算/错算
+
+**两边都提供“可重跑补偿”任务，保证计费链路可追溯、可修复。**
+
+chat-app -> admin 计费/归因时序图：
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Biz as "业务系统/调用方"
+    participant API as "chat-app API"
+    participant LLM as "上游模型厂商"
+    participant MainDB as "chat-app明细库(main/extend/draw/duration)"
+    participant AsyncJob as "chat-app异步回填任务(Sora/Veo/TingWu)"
+    participant AggJob as "chat-app聚合任务(daily/monthly)"
+    participant AggDB as "chat-app聚合库(daily/monthly)"
+    participant AdminSync as "admin归因同步任务"
+    participant Org as "组织服务(OrgClient)"
+    participant BillJob as "admin账单任务"
+    participant AdminDB as "admin计费库(charging_main/day/bill_detail)"
+    participant Ops as "看板/运营"
+
+    Biz->>API: 发起模型调用(同步/流式/异步)
+    API->>LLM: 转发请求
+    LLM-->>API: 返回结果 + usage/token
+    API->>MainDB: 落主记录与扩展记录(系统/用户/模型/usage/费用字段)
+
+    opt 异步多媒体任务
+        API->>MainDB: 记录任务状态(PENDING)
+        AsyncJob->>LLM: 轮询任务结果
+        LLM-->>AsyncJob: 完成状态 + 时长/分辨率等
+        AsyncJob->>MainDB: 回填duration/扩展费并标记完成
+    end
+
+    AggJob->>MainDB: 按日拉取明细(main/extend/draw/duration)
+    AggJob->>AggDB: 生成/更新日聚合(daily)
+    AggJob->>AggDB: 生成/更新月聚合(monthly)
+
+    AdminSync->>MainDB: 同步计费主数据(ChargingMainSync)
+    AdminSync->>Org: 查询用户组织信息(用户->部门)
+    Org-->>AdminSync: 返回组织层级
+    AdminSync->>AdminDB: 回写charging_main + 部门归因
+    AdminSync->>AdminDB: 汇总charging_day(ChargingDaySync)
+
+    BillJob->>AdminDB: 生成日账单明细(system/org)
+    BillJob->>AdminDB: 更新系统/组织累计消耗
+    BillJob->>Ops: 触发月账单发送/欠费预警
+
+    Ops->>AdminDB: 查询报表/看板/归因结果
+
+    opt 数据补偿与重算
+        AdminSync->>AdminDB: charingMainDataClean(历史重算/修正)
+        AdminSync->>AdminDB: charingDayDataClean(日维重刷)
+    end
+
+```
+
+##### （6）费用计算与账单归因的数据都会落到哪些库
+
+**chat-app 计费明细库（原始与回填）**
+主要是调用明细与异步回填结果：
+- chat_gpt_main（主调用明细）
+- chat_gpt_main_extend（扩展 usage，如 search/tool/cache/thinking 等维度）
+- draw_history / ai_draw_pic（图片生成相关）
+- 时长/异步任务回填相关明细（视频/音频转写等，供后续聚合）
+
+**chat-app 聚合库（日/月）**
+聚合任务产物：
+- chat_gpt_daily_cost_aggregation（日聚合）
+- chat_gpt_monthly_cost_aggregation（月聚合）
+- chat_gpt_daily_agg_process_log（聚合过程日志）
+
+**admin 归因与账单库（最终运营口径）**
+归因同步 + 账单生成产物：
+- chat_gpt_charging_main（归因后的主计费记录，含用户/组织映射）
+- chat_gpt_charging_day（日统计）
+- chatgpt_bill_detail（账单明细，系统/组织扣费）
+- chat_gpt_department（组织维度映射）
+
+**一句话总结：chat-app 先落“明细+聚合”，admin 再落“归因+账单”。**
+
+#### （5）当前支持的复杂计费
+
+##### （1）分级计费
+
+当前已经通过 `ChatGptModelFeeLevelEnum` 支持：
+
+1. 按输入上下文长度分级：
+   - 例如 `0-32K`、`32K-128K`、`128K-256K`
+2. 按模型特性分级：
+   - 文本/图片双 token
+   - 搜索档位
+   - 视频是否带声音
+   - 视频码率：4K / 1080P
+3. 按来源类型分级：
+   - `sourceType`
+   - `resolution`
+   - `cacheType`
+
+##### （2）缓存写入 / 命中计费
+
+当前已经有明确实现：
+
+1. `cacheReadTokens`
+2. `cacheWriteTokens`
+3. `cacheType`
+4. `PromptTokensDetails.writeCacheDetails`
+
+并且：
+
+1. `ClaudeCacheTypeEnum` 已支持 `5m`、`1h`、`mix` 等时间的缓存。
+2. `TokenFeeComponent` 已能：
+   - 读取 cache read tokens
+   - 读取 cache write tokens
+   - 按 TTL 倍率计算写缓存费用
+   - 混合 TTL 时按明细逐段计算
+
+总结：当前方案并不只是“记录缓存 token”，它已经把缓存写入和缓存命中当成了收费维度。把 cache write/read token 分开计费，且可区分 缓存 TTL（如 5m/1h），根据不同的 TTL 分别计费。
+
+**公式：写入费 = cache_write_tokens × 写入单价，命中费 = cache_read_tokens × 命中单价**
+
+##### （3）联网搜索计费
+
+当前也已部分支持：
+
+1. Qwen `enable_search`
+2. Gemini `google_search`
+3. Volcengine `ai_search / reasoning_search`
+4. 一些搜索型费用通过 `modelLevel` 或 `actionUsage` 进入定价
+
+**总结：当前联网计费按 search/tool usage 次数或 usage 量计费（依配置）**
+
+**公式：费用 = 搜索次数(或usage量) × 搜索单价**
+
+但问题是：搜索能力在旧方案里没有形成统一“联网调用事件模型”，而是分散在模型特定字段和动作计费分支里。
+
+##### （4）思考 token
+
+当前系统已经开始接住这类信息：
+
+1. OpenAI reasoning 响应
+2. Claude thinking / reasoning content
+3. Gemini `thoughtsTokenCount`
+
+**总结：对 reasoning/thinking token 单独统计，是否单独收费由模型与费率配置决定**
+
+**公式（若开启）：费用 = reasoning_tokens × reasoning单价；未单独配置时常并入 completion**
+
+但旧方案的问题是：
+1. “思考过程内容”有记录
+2. “思考 token 数”在部分模型里有接入
+3. “思考 token 独立计价”没有真正成为统一账务维度
+
+它更多还是被折叠进 `completionTokens` 或模型特殊处理里。
+
+
+### Q14：`aigc-multimedia` 数据统计（含计费）流程详解
+
+#### （1）总体模式
+
+`aigc-multimedia` 的职责不是“立即算账”，而是：
+
+1. 负责异步任务提交
+2. 维护任务状态
+3. 在任务完成时补齐：
+   - 最终状态
+   - 时长 / token / 分辨率 / 音视频大小
+   - OSS 地址
+4. 把“已可计费任务”提供给统一收费侧拉取
+5. 收到收费侧成功回调后，把本地任务标记为“已上传计费”
+
+这是非常典型的“异步任务平台 + 费用上传状态机”。
+
+#### （2）当前异步计费链路
+
+典型流程：
+
+1. 提交异步任务，先写任务表，状态为 `SUBMITTED/PROCESSING`
+2. 轮询或接收回调，补齐：
+   - `taskStatus`
+   - `duration`
+   - `totalToken`
+   - `resolution`
+   - `sourceType`
+   - `videoOssUrl`
+3. 标记 `chargeUploadStatus = PENDING`
+4. 定时任务调用 `completedModelProcessByJob`
+5. 服务实现筛选出“待上传计费”的任务并返回 `ModelFeeCompletedResultDto`
+6. 统一收费侧完成入账后，调用 `chargeUploadCallBack`
+7. 本地任务状态改成 `UPLOADED`，避免重复上传
+
+#### （3）当前多媒体支持的收费口径
+
+| 场景 | 当前主要口径 | 当前字段 |
+|---|---|---|
+| Veo / Sora / 火山视频 | `duration` 或 `totalToken` | `duration`, `totalToken`, `sourceType`, `resolution` |
+| 实时/离线转写 | `duration`、`characters`、能力模块拆分 | `TwTrans` 结果 + 任务状态 |
+| 文生视频带声音/不带声音 | `sourceType` + `modelLevel` | `sourceType`, `fdModelKey` |
+| 高清/4K | `resolution/modelLevel` | `resolution`, `modelLevel` |
+
+#### （4）当前方案的优点
+
+`aigc-multimedia` 这一层其实做对了两件很重要的事：
+
+1. 它把“任务完成”和“费用上传成功”分成两个状态
+2. 它没有在厂商响应一到就直接认定收费成功，而是等统一收费侧回调确认
+
+这对于异步任务非常关键，因为异步任务天然会遇到：
+
+1. 结果已生成但费用没上传成功
+2. 费用已上传但回调没打回来
+3. 多次轮询命中同一任务
+4. 任务失败需要取消上传
+
+旧方案虽然比较散，但在“防重复上传”和“异步补偿”上已经有成熟思路。
+
+#### （5）详细的计费过程
+
+这个流程理解成“multimedia 产出计费素材，统一收费侧做计费入账”
+
+**整体的流程为：**
+- aigc-multimedia 在任务完成后，把任务补齐为“可计费态”
+- 统一收费侧（当前主要是 chat-app 的定时任务）按模型类型拉取“可计费任务”
+    - 典型是 Veo/Sora/TingWu 这些 job，通过 modelFeeClient/geminiClient/soraVideoClient 拉待计费完成任务。
+- 统一收费侧按计费规则计算费用,根据模型和计费口径选规则：
+    - token 口径（输入/输出/缓存/thinking）
+    - 时长口径（秒、分钟）
+    - 规格口径（分辨率、sourceType、是否带音轨）
+    - 必要时结合 modelLevel 映射到更细价格档。
+- 统一收费侧落计费记录（明细/聚合）
+    - 会写入统一计费明细（如 duration collect / main extend 等）并进入日/月聚合链路，后续再被 admin 做账单归因。
+- 成功后回调 multimedia 做“已上传计费”确认
+    - 通过 chargeUploadCallBack 这类回调把任务标记为已计费，避免重复拉取重复扣费；失败则保留重试状态，下一轮任务继续补偿。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
