@@ -322,6 +322,8 @@ LoginNameInterceptor 在进入 Controller 前执行。它会读取 AIGC_USER，�
 - 将 system(appKey) 写入 request：request.setAttribute("system", appKey)；
 - 校验黑名单：isUserBlack(userName, appKey)，命中直接拒绝。
 
+这里 secretKey 是算法平台用户在创建信息的时候同步给外部大模型管理平台的，此处我们记录在“业务方基础信息“这里，用于验证 app_access_token 与业务方（即 appkey）是否一致。（先验证 appkey 是否存在，后续验证 appkey 与 token 的 secretKey 是否对应得上。）
+
 ##### （3）请求参数解析与基础合法性检查
 
 进入 OpenAiExternalController#doStandardMode(...)：
@@ -335,15 +337,15 @@ LoginNameInterceptor 在进入 Controller 前执行。它会读取 AIGC_USER，�
 调用 checkUtil.checkModel(model, system)，这里是最关键治理点：
 
 - 校验系统是否存在；
-- 校验系统模型白名单（fdModels）是否包含当前模型；
-- 执行 flowControl(system, model)：**时段阈值限流 + 费用阈值检查**；
-- 执行 checkCutoff(systemDto)：**断流状态检查（欠费/停服）**。
+- 校验系统模型白名单（fdModels）是否包含当前模型，即校验改系统是否有申请当前模型；
+- 执行 flowControl(system, model)：**时段阈值限流 + 费用阈值检查，就是检查系统对某个模型在某个时段内调用次数与费用是否超过设定值，如：检查系统对某个模型每分钟调用次数与每天调用费用是否超过设定值；**
+- 执行 checkCutoff(systemDto)：**断流状态检查（欠费/停服），就是检查该系统是否已经欠费停服，由定时任务算账确定改系统是否已经超预算**。
 
 ##### （5）外部接口次数限流（system-user-model）
 
 调用 openAiExternalCallLimitService.checkAndIncrement(system, user, model)：
 - 用 Redis+Lua 原子计数，键为 openai:external:call:limit:{date}:{system}:{user}:{model}；
-- 超过额度直接拒绝。
+- 这里维度：date + system + user + model，检查的是某个系统里的某个用户某天对某个模型的调用量是否超过设定值。
 
 ##### （6）进入模型调用链路
 
@@ -389,14 +391,14 @@ flowchart TD
 --header 'Aimp-Biz-Id: qwen3.5-plus' \
 --header 'AIGC-USER: ex_dengyj5' \
 --header 'Content-Type: application/json' 
-- 请求经过算法平台的网关（参考 `SystemController.java-accessTokenTest`），会被转换为`App-Access-Token`，那后端使用`@CheckAccessToken`就可以进行解析鉴权，用户则不需要关系`secret-key`
+- 请求经过算法平台的网关（参考 `SystemController.java-accessTokenTest`），会被转换为`App-Access-Token`，那后端使用`@CheckAccessToken`就可以进行解析鉴权，用户则不需要关心`secret-key`
 
 **服务端（AccessTokenAspect）流程：**
 - 取 App-Access-Token，用配置的 aesKey 解密，反序列化成 AccessKeyDto。
 - 校验字段完整性（appKey/time/aKey）。
 - 按 appKey 查系统是否存在。
 - 用库里的 secretKey 重新计算 MD5(secretKey + time)，比对 aKey。
-- 校验时效（当前代码是 1 小时内有效）。zuos'fe
+- 校验时效（当前代码是 1 小时内有效）。
 - 写入 request.setAttribute("system", appKey)；再做黑名单校验。
 - 后续 LoginNameInterceptor 读取 AIGC_USER 放入 UserUtils。
 
@@ -407,13 +409,15 @@ flowchart TD
 - 另外仍建议带 AIGC_USER（用于归因、黑名单）。
 
 **服务端（SecretKeyAspect）流程：**
-- 取 Authorization，校验前缀 Bearer 。
+- 取 Authorization，校验前缀 Bearer secretKey。
 - 取出 token（即 secretKey）。
 - selectAccessSystemBySecretKey(secretKey) 查系统；不存在就拒绝。
 - 写入 request.setAttribute("system", appKey)。
 - 做黑名单校验后放行。
 
 ##### （2）时段阈值限流 + 费用阈值检查
+
+**检查某个系统对某个模型每分钟调用次数与每天调用费用是否超过设定值。**
 
 核心在 ChatGptLimitingServiceImpl.java (line 100) 的 flowControl(system, modelKey)。
 
@@ -430,6 +434,8 @@ flowchart TD
 
 - 若 number > config，抛 CHAT_GPT_LIMITING 拒绝。
 
+总结：调用次数（appkey+modelkey）不能大于 `chatgpt_app_model_limit_config` 里面 `rate_limit_per_minute`字段配置的值，**即某个系统对某个模型每分钟调用次数不能超过设定值。**
+
 **费用阈值检查执行逻辑（同一个 flowControl 内）：**
 - 先用 getConfigFee(system, model, time) 取当日费用阈值（同样 DB 优先，其次配置，最后 defaultFee）。
 - 再 computeModelFee(...)（或 computeModelFeeByTimes(...)）读取日累计 usage/fee 缓存，按模型单价换算当日费用。
@@ -437,6 +443,8 @@ flowchart TD
   - 少数模型（如 agent 模型）走 computeModelFeeByTimes(...)：按请求次数 * 单次单价来算。
 - 超过阈值抛 CHAT_GPT_FEE_OVER_LIMIT。
 - 在 80%/100% 阈值会触发告警消息（IM），100%会拦截。
+
+总结：费用（appkey+modelkey）不能大于 `chatgpt_app_model_limit_config` 里面 `daily_cost_limit`字段配置的值，**即某个系统对某个模型每天调用费用不能超过设定值。**
 
 ##### （3）断流状态检查
 
@@ -467,7 +475,7 @@ flowchart TD
     - 未达额度则 incr。
 返回负值即抛 OPEN_AI_CALL_LIMITING，请求拒绝。
 
-**这条链路是“先 flowControl(时段+费用)，再 checkCutoff(断流)，再 externalCallLimit(次数)”，三道闸都过了才会真正进入模型调用。**
+**这条链路是“先 flowControl(系统+模型：每个时段内调用次数与费用限制，如：每分钟分钟调用次数+每天费用)，再 checkCutoff(断流，系统是否已经欠费)，再 externalCallLimit(次数)”，三道闸都过了才会真正进入模型调用。**
 
 ##### （5）时间阈值维度 与 次数校验的关系
 
@@ -511,7 +519,7 @@ isCutoff 通常由账务/欠费任务异步更新（例如 OverduePaymentAlertDa
 
 ##### （7）限流与费用限制整体流程图
 
-**如下：先判断是否断流（超预算），然后判断时段是否超限制，最后实时判断费用是否超预算。**
+**话术：先判断是否断流（超预算），然后判断时段内系统对某个模型的调用次数是否超限制，最后实时判断时段内某个系统对某个模型的调用费用是否超预算。**
 
 ```mermaid
 flowchart TD
@@ -2272,12 +2280,53 @@ sequenceDiagram
     - 通过 chargeUploadCallBack 这类回调把任务标记为已计费，避免重复拉取重复扣费；失败则保留重试状态，下一轮任务继续补偿。
 
 
+### Q15：调用完成之后，会将调用明细和费用相关的信息写入缓存，相关缓存如下
 
+- TOKEN_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：prompt/completion/total tokens累计
+    - 作用：给限流/费用阈值检查提供实时用量基础。
 
+- TIMES_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：请求次数累计
+    - 作用：按次数计费模型/次数阈值控制。
 
+- FEE_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：当日累计费用（阶梯或统一口径）
+    - 作用：费用阈值（80%预警、100%拦截）。
 
+- OpenAI external 调用次数限流 key
+形如 openai:external:call:limit:date:system:user:model
+    - 作用：单日单用户单模型调用次数原子限流（Lua脚本）。
 
+- IMAGE_FEE_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：图片费用与张数（ImageUsage）
+    - 作用：图片场景阈值/计费监控。
 
+- VIDEO_FEE_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：音视频相关累计费用（ChatGptUsage.totalFee等）
+    - 作用：多媒体费用阈值控制。
+
+- TRANSLATE_SINGLE_DAY_KEY（按天、system+model）
+    - 内容：字符数累计（翻译）
+    - 作用：字符计费阈值检查。
+
+一句话：**这些缓存是给实时限流/阈值/告警用的；最终财务口径仍以明细落库 + 日月聚合 + admin归因为准。**
+
+### Q16：怎么保证“调用成功、明细入库、计费采集、上传智数”一致性
+
+**当前这套更像最终一致性，不是强事务一致**：
+
+- 调用成功 ≠ 入库必成功：saveNewCommResponse 里有 try-catch，失败会记日志但不回滚已返回结果。
+
+- 入库成功 ≠ 智数上报必成功：上报也可能失败，同样靠异常日志与后续聚合/补偿兜底。
+
+- 阈值控制依赖缓存累计和定时聚合，不依赖单次请求100%成功上报。
+
+- 真正账单口径在后续日/月聚合 + admin 归因任务里“再收敛一次”。
+
+**一句话**：我们采用**在线可用性优先 + 计费最终一致性**的设计。在线链路先保障模型调用返回（同步一次性返回、流式逐段flush）；随后执行调用明细落库与计费采集上报。这些步骤不是单事务强绑定：任一后置步骤失败不会阻塞主调用返回，而是通过**异常留痕、监控告警、缓存累计和定时聚合/补偿任务进行修正**。
+
+因此系统在高并发下保证体验稳定，账单侧通过日/月聚合与归因任务收敛为最终一致口径。
 
 
 
