@@ -765,21 +765,23 @@ sequenceDiagram
 
 ### Q5：AigcApi 这里使用了什么设计模式，作用是什么？
 
-核心是 **策略模式 + 模板方法 + 适配器思路**
+核心是 **策略模式 + 模板方法**
 
 **策略模式（按模型/厂商切实现）：**
 
-`ChatGptServiceImpl` 里通过 `Map<String, AigcApi> aigcApiMap` 取具体实现，再调用统一方法（`syncChatGpt/streamChatGpt/...`）。
+含义：把“可替换算法”封装成一组实现，运行时按条件选择。这里不同模型/厂商就是不同策略实现（都实现 AigcApi），调用侧通过 Map<String, AigcApi> 按 modelKey 取实现再执行。
 
-**模板方法（基类沉淀公共流程）**
+作用：新增模型不改主流程，只加一个实现并注册。
 
-很多实现继承 BaseOpenAiServiceImpl，把“组包、选资源、发请求、流读取、落日志”等公共流程放基类，子类按模型差异**覆盖/扩展**。
+**模板方法（公共流程沉淀）**
 
-**适配器思路（统一多厂商能力面）**
+含义：在父类定义通用流程骨架，子类只改差异步骤。这里 `BaseOpenAiServiceImpl / BaseOpenAiImpl` 里放通用流程（请求构建、流式读取、错误处理、usage处理、保存入口），子类按模型差异覆写少量步骤。
 
-AigcApi 定义了统一入口，同时通过 default 方法覆盖不同协议能力（OpenAI/Gemini/DeepSeek/图像/视频等），把上游差异“适配”成统一调用面。
+作用：减少重复代码，统一行为，降低改动风险。
 
-好处：**平台通过 AigcApi 把平台能力面和厂商实现面解耦，新增模型时优先复用抽象和保存链路，只在适配层补厂商差异。**
+**总结**：chat-app 在多模型接入上主要用了策略模式和模板方法模式。
+- 模板方法这层通过基础父类沉淀通用调用骨架，比如请求构建、流式读取、异常处理、usage解析和结果保存，子类只覆盖模型差异逻辑，这样可以减少重复代码并保证行为一致。
+- 策略模式这层通过 Map<String, AigcApi> 按 modelKey 路由到对应实现，不同厂商或模型就是不同策略，新增模型时通常只需要新增一个实现并注册映射，不需要改主流程代码，所以扩展性和维护性都更好。
 
 ### Q6：各种模型调用说明
 
@@ -945,7 +947,7 @@ PTU 一般是 Provisioned Throughput Unit（**预置吞吐单元/预留吞吐能
 - 区域路由、统一监控、限流、计费、审计、模型池路由、fallback 等，更容易在一个平台里统一做。
 
 **为什么要这样设置？**
-- 因为你们是“外部大模型管理平台”场景：重点不是“最短路径调用模型”，而是**统一治理、稳定性、合规、成本可控、可观测。**Bedrock 方案更符合这个目标。
+- 因为你们是“外部大模型管理平台”场景：重点不是“最短路径调用模型”，而是 **统一治理、稳定性、合规、成本可控、可观测。** Bedrock 方案更符合这个目标。
 
 ##### （3）Tool 到底怎么用？为什么请求里要定义 tool？
 
@@ -1149,8 +1151,7 @@ sequenceDiagram
 
 - 第二次请求，你不再让模型从头“消化”这大段背景，而是直接引用这份缓存，然后只处理新问题
 
-所以缓存命中的本质是： **复用旧输入上下文的处理成本
-不是复用旧回答结果本身** ，这也是为什么代码里统计的是cachedContentTokenCount（命中的输入 token），而不是“命中的输出 token”或“命中的回答条数”。
+所以缓存命中的本质是： **复用旧输入上下文的处理成本，不是复用旧回答结果本身** ，这也是为什么代码里统计的是cachedContentTokenCount（命中的输入 token），而不是“命中的输出 token”或“命中的回答条数”。
 
 
 ##### （3）Google Search 相关标志透传 / 计费扩展 是什么意思？
@@ -1494,10 +1495,80 @@ flowchart TD
 
 ### Q8：同步接口与流式接口返回的问题
 
-同步的接口都有一个返回值：ResponseVO<ChatGptResponse>，而流式接口返回值都是 void。原因：
+我们项目里“是否同步/流式”与“方法是否 void”不是一一对应关系。很多大模型透传接口统一**用 HttpServletResponse 直写返回**：流式场景是分片 write+flush，同步场景是完整结果一次写回；而 ResponseVO 更多用于普通 CRUD/管理查询接口。核心区别在HTTP返回方式，不在 Java 方法返回类型。
 
-- 同步接口是“一次性返回完整结果”，所以走标准 MVC 返回值：ResponseVO<...>。
-- 流式接口虽然方法签名是 void，但它通过 HttpServletResponse 的输出流持续 write + flush 把分片数据推给客户端（SSE/chunked）。**所以流式“不是没返回”，而是“边算边写到连接里”，返回通道不在 Java 方法返回值，而在 HTTP 长连接本身。**
+
+更准确是这三类：
+- 直返型（MVC对象返回）
+    - 方法返回 ResponseVO<T>（或对象），由 Spring 序列化后一次性返回。
+    - 这类常见于管理/查询/配置类接口，不一定是大模型透传主链路。
+
+- 透传型（同步也可能是 void）
+    - 像 OpenAiExternalController.standardMode 这种，方法签名是 void，但它不代表流式；它会把结果直接写到 HttpServletResponse。
+    - 在 BaseOpenAiImpl.standardChatCompletion 里：
+        - stream=true：循环 write + flush 分片返回
+        - stream=false：把完整结果一次 write + flush 返回
+    - 所以同步也可以是 void，只是“写一次”而不是“分片写”。
+- 流式型（通常 void + 输出流）
+    - 通过 HttpServletResponse 持续写回（SSE/chunked），Java 返回值不承载业务结果。
+
+Java 返回值直接返回，适合结果很快一次性拿全。特点：
+- Spring 帮你序列化并返回
+- 客户端要等服务端“全部算完”才收到响应体
+- 简单、标准、便于接口文档化
+
+~~~java
+@RestController
+@RequestMapping("/demo")
+public class SyncController {
+
+    @PostMapping("/sync")
+    public ResponseVO<String> sync() {
+        // 先算完
+        String fullResult = "完整答案一次返回";
+        // 再统一返回
+        return ResponseVO.success(fullResult);
+    }
+}
+~~~
+
+HttpServletResponse 持续写回（SSE/chunked），适合：流式输出、长耗时任务、边生成边返回。特点：
+- Java 方法是 void，业务结果不走返回值
+- 数据通过 HTTP 连接“边写边发”
+- 客户端可实时看到增量结果（打字机效果）
+
+~~~java
+@RestController
+@RequestMapping("/demo")
+public class StreamController {
+
+    @GetMapping("/stream")
+    public void stream(HttpServletResponse response) throws IOException {
+        response.setContentType("text/event-stream;charset=UTF-8");
+        response.setHeader("Cache-Control", "no-cache");
+        response.setHeader("Connection", "keep-alive");
+
+        PrintWriter writer = response.getWriter();
+
+        // 模拟分段生成
+        for (int i = 1; i <= 5; i++) {
+            writer.write("data: 第" + i + "段内容\n\n"); // SSE格式
+            writer.flush(); // 立刻推给客户端
+            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        }
+
+        writer.write("data: [DONE]\n\n");
+        writer.flush();
+    }
+}
+
+~~~
+
+核心区别一句话
+- return ResponseVO：先算完，再返回
+- HttpServletResponse.write+flush：边算边返回（适合流式）
+
+
 
 ### Q9：chat-app 和 aigc-multimedia 
 
@@ -1533,6 +1604,28 @@ flowchart TD
 
 它同时有定时补偿能力：对处理中或长时间未闭环任务做二次检查，避免任务丢失或计费漏传。
 
+流程图如下：
+```mermaid
+flowchart TD
+    A["Client 提交生成请求"] --> B["落库 multimedia_video<br/>task_status=SUBMITTED<br/>charge_upload_status=PENDING"]
+    B --> C{"调度触发<br/>checkTaskStatus"}
+    C --> D["Redis限频/分布式锁<br/>避免频繁并发调度"]
+    D --> E{"是否有可用并发槽"}
+    E -- 否 --> F["保持 SUBMITTED（排队）"]
+    E -- 是 --> G["抢槽成功（原子更新）<br/>task_status: SUBMITTED -> PROCESSING"]
+    G --> H["调用上游厂商创建/查询任务"]
+    H --> I{"上游结果"}
+    I -- 处理中 --> J["保持 PROCESSING，等待下轮轮询"]
+    I -- 成功 --> K["下载结果 -> 上传OSS -> 更新video元数据"]
+    I -- 失败 --> L["task_status=FAILED"]
+    K --> M["形成可计费结果集（仅首次）"]
+    L --> N["charge_upload_status=CANCELED"]
+    M --> O["回调 chargeUploadCallBack"]
+    O --> P["charge_upload_status=UPLOADED"]
+    P --> Q["后续任务只扫 PENDING，已UPLOADED不再重复计费"]
+```
+
+
 ##### （3）核心差异
 
 **chat-app：请求即执行，重点是鉴权/限流/资源路由/实时返回。**
@@ -1563,6 +1656,15 @@ flowchart TD
 - 保证队列有序推进（先提交先处理）。
 
 总结：**并发槽位就是异步任务的流控阀门，先抢槽位再发任务，避免上游雪崩。**
+
+这里任务入队、抢并发槽、发起任务的原理如下：
+- 入队（本质是数据库状态队列），新任务保存时直接置为 SUBMITTED
+- 对于抢并发槽，我们用的是“**分布式锁 + 节点容量判断 + 数据库状态队列**”三段式调度。
+  - 首先按 model 维度抢 Redis 分布式锁（避免并发重复提交）
+  - 拿到锁后，统计该模型下各节点 PROCESSING 任务数，只有当某节点当前负载 < maxProcessNum 才允许继续派发
+  - 最后从库里按 create_time 升序取最早的 SUBMITTED 任务提交到上游，提交成功后把任务状态更新为 PROCESSING，继续后续轮询与回写。
+
+
 
 ##### （2）对处理中或长时间未闭环任务做二次检查，怎么做的？
 
@@ -1733,10 +1835,10 @@ M --> P
 1. 请求调用上游模型
 2. 解析 usage / token / 图片 /缓存 / 搜索等信息
 3. 保存业务明细
-4. 在请求完成后异步触发计费上报
+4. 在请求完成后异步触发计费上报智数平台
 5. 再通过日/月任务做聚合
 
-
+**总结**：当前计费链路是“在线采集 + 后置聚合”的最终一致性模式，接口调用成功后先落调用明细到 chatgpt_main，并同步触发一次计费采集上送（智数平台）；同时将 token/次数/费用等日累计指标写入 Redis，用于实时限流与费用阈值控制；后续再通过日/月聚合任务将费用沉淀为账单口径数据，并进入 admin 侧做组织归因与账单出具，从而在保障在线可用性的同时保证计费结果可追溯、可收敛。
 
 #### （2）请求级明细（实时）
 
@@ -1744,7 +1846,7 @@ M --> P
 
 ##### （1）本地落库保存的信息
 
-- chatgpt_main：核心调用明细
+- chatgpt_main：主调用明细（模型、系统、token、scene、cache等）
     - 用户：fd_user_id
     - 系统：system_sign
     - 模型：fd_model
@@ -1754,8 +1856,32 @@ M --> P
     - 缓存token：cache_read_tokens/cache_write_tokens
 
 - 相关业务表（按场景）
-    - 文本内容/会话内容表（如 chat content）
-    - 画图/视频/扩展用量表（draw、extend等）
+    - chatgpt_content：问答内容明细（请求/响应内容）
+    - chatgpt_main_extend：扩展用量（如 action/search 等）
+    - 图片相关：ai_draw_history、ai_draw_pic（生图明细）
+    - 聚合过程日志：chatgpt_daily_agg_process_log
+
+补充：后续日/月聚合任务的计费详情（费用/账单归因）落库信息
+- **chat-app 侧聚合计费层**
+    - chatgpt_daily_cost_aggregation（日聚合费用）
+    - chatgpt_monthly_cost_aggregation（月聚合费用）
+
+- 对应作业：
+  - dailyCostAggregationJob
+  - dailyCostAudioAggregationJob
+  - monthlyCostAggJob
+
+- **admin/auth 侧账单归因层（最终账单口径）**
+    - chatgpt_charging_main（归因后的主计费记录）
+    - chatgpt_charging_day（日维计费汇总）
+    - chatgpt_bill_detail（账单明细，系统/组织扣费）
+    - chatgpt_department（部门归因维度）
+
+- 对应作业：
+    - ChargingMainSyncHandler
+    - ChargingDaySyncHandler
+    - DailyBillHandler
+
 
 ##### （2）查询价格明细并计算请求费用
 
@@ -1821,10 +1947,9 @@ M --> P
 每次调用费用上报智数成功后，chat-app 会把这笔费用同时累加到 Redis 的日维度键（**系统 + 模型 + 日期**）里，形成实时费用水位。随后读取该系统该模型的日预算阈值，判断当前累计费用是否跨过告警档位（如 80%、100%）。如果触发且当天该档位还没发过，就通过分布式锁控制只发一次告警邮件，避免重复轰炸。
 
 ##### （3）一段话描述
-
-- 请求完成后先查找模型价格，然后按**模型、计费类型和生效价格规则**计算本次费用；
-
-- 随后把调用明细（用户、系统、模型、token/时长、费用等）落到 chatgpt_main 等业务表，保证本地可追溯；
+- 调用成功把调用明细（用户、系统、模型、token/时长、费用等）落到 chatgpt_main 等业务表，保证本地可追溯；
+  
+- 随后要计算请求费用，先查找模型价格，然后按**模型、计费类型和生效价格规则**计算本次费用；
 
 - 最后再将标准化统计数据上报到智数平台，支撑跨系统的统一统计、成本分析和后续的数据挖掘与治理。
 
@@ -1963,13 +2088,6 @@ M --> P
 读写缓存分别指的是：
 - **写缓存（cache_write）**：把这段可复用前文在模型侧缓存起来，供后续请求复用。
 - **读缓存（cache_read）**：后续请求命中后，不再重复完整处理这段前文，而是引用缓存内容。
-
-
-**token 计费分三层：**
-- 第一层是基础 token，即 prompt_tokens（输入）和 completion_tokens（输出），总量为 total_tokens，这是最核心计费口径；
-- 第二层是细分 token，用于解释成本构成，常见有 text_tokens（文本分词消耗）、reasoning_tokens（模型推理消耗）、image_tokens（多模态图片折算消耗）等，通常由上游 usage 明细返回并汇总到输入/输出；
-- 第三层是缓存 token，包括 cache_write_tokens（把可复用上下文前缀写入缓存的消耗）和 cache_read_tokens（命中缓存并复用前缀的消耗），其是否并入输入计费或独立按读写单价计费由模型费率规则决定。
-**整体作用是：基础 token 决定主费用，细分 token 提供可解释性，缓存 token 用于降重复计算、控成本和降时延。**
 
 ##### （2）计费方案总览
 
@@ -2314,28 +2432,86 @@ sequenceDiagram
 
 ### Q16：怎么保证“调用成功、明细入库、计费采集、上传智数”一致性
 
-**当前这套更像最终一致性，不是强事务一致**：
+#### （1）两个关键任务说明
 
-- 调用成功 ≠ 入库必成功：saveNewCommResponse 里有 try-catch，失败会记日志但不回滚已返回结果。
+**charingMainDataClean（历史主数据清洗/重算）**
 
-- 入库成功 ≠ 智数上报必成功：上报也可能失败，同样靠异常日志与后续聚合/补偿兜底。
+核心数据来源：从 chatgpt_main 按时间、模型、系统、data_clear 状态拉数据
 
-- 阈值控制依赖缓存累计和定时聚合，不依赖单次请求100%成功上报。
+核心处理：
+- 重新整理 token/费用字段、补齐组织信息、清洗异常字段
+- 将整理后新的费用组织等信息写入 chatgpt_charging_main
+- 回写 chatgpt_main.data_clear（标记已清洗/异常类型）
 
-- 真正账单口径在后续日/月聚合 + admin 归因任务里“再收敛一次”。
+作用：修复“历史漏算/错算/口径变更”问题，是“主明细重建器”
 
-**一句话**：我们采用**在线可用性优先 + 计费最终一致性**的设计。在线链路先保障模型调用返回（同步一次性返回、流式逐段flush）；随后执行调用明细落库与计费采集上报。这些步骤不是单事务强绑定：任一后置步骤失败不会阻塞主调用返回，而是通过**异常留痕、监控告警、缓存累计和定时聚合/补偿任务进行修正**。
+**charingDayDataCleanHandler（按天聚合重刷）**
 
-因此系统在高并发下保证体验稳定，账单侧通过日/月聚合与归因任务收敛为最终一致口径。
+核心数据来源：从 chatgpt_charging_main 按天聚合
+
+核心处理：
+- 把某天聚合结果写入 chatgpt_charging_day（insertOrUpdate，幂等）
+- Redis 记录执行进度（日期队列、失败日期 failDateList）
+- 分布式锁避免并发重复跑
+
+结果落地：日账单口径表 chatgpt_charging_day
+
+作用：**快速修复“某几天归因不准/漏算”的问题，是“日账单重刷器”**
 
 
+#### （2）最终一致性怎么保证
+
+**你现在这套不是“强事务一次成功”，而是在线可用优先 + 计费最终一致**：
+
+- 主调用成功优先：先保证接口返回（同步一次性返回 / 流式持续 flush）。后置链路异步容错：明细、计费上报、聚合归因，不阻塞主请求。
+- 通过失败留痕(异常日志) + 重试任务 + 重算任务把账补齐。
+
+> 下面说明一下整体的链路
+
+**（1）调用成功 -> 明细入库**
+
+- 正常路径：调用返回后写 chatgpt_main。
+- 若失败：会记录错误日志/监控；后续用补数+重算修复（先补主明细，再重刷 day）。
+- 关键点：主明细是根，后续聚合都依赖它。
+
+**（2）明细入库成功 -> 计费采集/上传智数失败**
+
+- SupplierServiceImpl 上报失败会留异常记录（异常留痕）。
+- 后续由 SmartDataPlatformPushAgainJob 重推（有最大重试次数、成功/失败状态更新）。
+- 所以：上报失败不影响在线返回，但会进入补偿队列。
+
+**（3）日/月归因任务失败 -> 费用缺失**
+
+- 用 charingMainDataClean 重建 charging_main（主口径）。
+- 再用 charingDayDataCleanHandler 按天重刷 charging_day。
+- 失败日期有 failDateList，可按日期定向重刷。
+- 幂等 SQL（ON DUPLICATE KEY UPDATE）支持同一时间窗反复跑，直到对齐。
 
 
+**（4）如何避免重复计费**
+- 明细重建、日聚合都是 upsert（不是盲目 insert）。
+- 有清洗状态位（data_clear）和任务锁，避免并发重复处理。
+- 智数重推任务是“状态驱动重试”，成功后不再重复推。
 
+```mermaid
+flowchart TD
+    A["模型调用成功(在线返回)"] --> B["写 chatgpt_main 明细"]
+    B --> C["本地计费采集/组装上报报文"]
+    C --> D{"上传智数成功?"}
+    D -- "是" --> E["上报完成"]
+    D -- "否" --> F["异常留痕(smart_exception_push)"]
+    F --> G["smartDataPlatformPushAgainJob 重试"]
+    G --> H{"重试成功?"}
+    H -- "是" --> E
+    H -- "否" --> I["保留失败状态/继续重试窗口"]
 
-
-
-
+    B --> J["charingMainDataClean 重建 charging_main"]
+    J --> K["charingDayDataCleanHandler 重刷 charging_day"]
+    K --> L{"日账单对齐?"}
+    L -- "否" --> M["按失败日期/时间窗再次重刷"]
+    M --> K
+    L -- "是" --> N["账单归因完成(最终一致)"]
+```
 
 
 
