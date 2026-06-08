@@ -63,7 +63,7 @@ xxl-job-admin：调度中心 + 控制面，核心职责：
 - **`scheduleThread` 扫描线程**：
   - 基于 MySQL `for update` 的悲观表级/行级锁防并发，保证一台 Admin 扫库时不会有别人抢资源（当前线程扫描完提交后其他线程才能尝试重新获取锁）。
   - **预读机制**：每次拉大数据库未来 5 秒内需触发的任务。
-  - **分发机制**：如果任务“过期超过 5 秒”（Misfire，**控制台挂机/重启、线程饥饿或数据库卡顿** 等原因导致），走 Misfire 补偿：
+  - **分发机制**：如果任务没有过期超过 5 秒，则重新执行，如果“过期超过 5 秒”（Misfire，**控制台挂机/重启、线程饥饿或数据库卡顿** 等原因导致），走 Misfire 补偿：
     - DO_NOTHING（默认）：什么都不做。
     - FIRE_ONCE_NOW：立刻马上强行触发一次。
   - 如果在未来 5 秒内，则将其“秒级别刻度”放入时间轮 `ringData` (一个 `ConcurrentHashMap<Integer, List<Integer>>`) 中。
@@ -99,7 +99,7 @@ xxl-job-admin：调度中心 + 控制面，核心职责：
 - **作用**：确保个别执行器网络卡顿或处理极慢的任务，只会占用慢线程池容量，不会拖垮全局所有的定时任务（快池依然畅通）。
 
 #### （5）`JobTrigger` 与 路由策略 (`ExecutorRouteStrategyEnum`)
-**设计定位：** 将模型转换成具体的 RPC 请求 (`TriggerRequest`) 并决定发给哪台机器。
+**设计定位：** 将模型转换成具体的 HTTP 请求 (`TriggerRequest`) 并决定发给哪台机器。
 
 **深入原理：**
 - `JobTrigger` 负责生成本次执行唯一的 `logId`，根据 `xxl_job_info` 配置拼装 `TriggerRequest`，包括传递运行参数、设置分片广播总数/索引等。
@@ -504,7 +504,7 @@ graph TD
 
 负责把来自 console-cloud 的请求按路径转发到对应服务，比如把“根据区域+环境获取前端入口配置”的请求转给 region-service，把后续业务请求转给对应区域前端。
 
-或者是， portal 根据 region+env+systemCode 返回需要路由的 dashboard 信息后，也需要提供 Apisix 进展转发。
+或者是， portal 根据 region+env+systemCode 返回需要路由的 dashboard 信息后，也需要提供 Apisix 进行转发。
 
 **（3）gnc-djs-region-service 区域入口目录服务**
 
