@@ -19,8 +19,8 @@
 
 - **CmdbSyncJob**：从 CMDB 拉取数据同步到本地。重复执行会导致短时间内对 CMDB 接口并发请求，增加源站压力甚至触发限流。
 - **NginxAgentUpgradeJob**：检测并触发 Agent 灰度升级。重复执行极度危险，可能导致同一批机器被下发两次升级指令。
-- HeartBeatTimeOutJob：扫描心跳超时的实例并标记其离线，短时间内双边重复扫描无意义，浪费性能
-- RefreshAgentInstallResultJob：查询并刷新 Agent 的安装或部署结果。重复执行会对底层或数据库造成不必要的查询压力。
+- **HeartBeatTimeOutJob**：扫描心跳超时的实例并标记其离线，短时间内双边重复扫描无意义，浪费性能
+- **RefreshAgentInstallResultJob**：查询并刷新 Agent 的安装或部署结果。重复执行会对底层或数据库造成不必要的查询压力。
 
 **如何避免：**
 
